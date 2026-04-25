@@ -1,0 +1,241 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v0.2.8. Must match Cargo.toml version."
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as pre-release?"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "Create as draft?"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  PACKAGE_NAME: slmtop
+  BIN_NAME: slmtop
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq musl-tools
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            brew update
+            brew install jq
+          fi
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install jq -y
+
+      - name: Verify Cargo.lock is up to date
+        run: cargo metadata --locked --format-version=1 --no-deps > /dev/null
+
+      - name: Read version from Cargo metadata
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION=$(cargo metadata --format-version=1 --no-deps -q \
+            | jq -r --arg pkg "$PACKAGE_NAME" '.packages[] | select(.name==$pkg) | .version')
+
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Failed to read version for package $PACKAGE_NAME"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            if [ "$TAG" != "v$VERSION" ]; then
+              echo "Tag $TAG does not match Cargo.toml version v$VERSION"
+              exit 1
+            fi
+          fi
+
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+            if [[ ! "$TAG" =~ ^v[0-9]+(\.[0-9]+){1,2}(-.+)?$ ]]; then
+              echo "Input tag must look like v0.2.8 or v0.2.8-beta.1"
+              exit 1
+            fi
+
+            if [ "$TAG" != "v$VERSION" ]; then
+              echo "Input tag $TAG does not match Cargo.toml version v$VERSION"
+              exit 1
+            fi
+          fi
+
+      - name: Build release binary
+        shell: bash
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" -p "$PACKAGE_NAME" -vv
+
+      - name: Package Unix binary
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VER="${{ steps.ver.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE_NAME="${BIN_NAME}-v${VER}-${TARGET}.tar.gz"
+
+          BIN_PATH="target/${TARGET}/release/${BIN_NAME}"
+          STAGE_DIR="dist/stage-${TARGET}"
+
+          mkdir -p "$STAGE_DIR"
+          cp "$BIN_PATH" "$STAGE_DIR/${BIN_NAME}"
+          cp README.md LICENSE "$STAGE_DIR/"
+
+          strip "$STAGE_DIR/${BIN_NAME}" || true
+
+          mkdir -p dist
+          tar -C "$STAGE_DIR" -czf "dist/${ARCHIVE_NAME}" .
+
+      - name: Package Windows binary
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}"
+          $target = "${{ matrix.target }}"
+          $archiveName = "${env:BIN_NAME}-v${ver}-${target}.zip"
+
+          $binPath = "target\$target\release\${env:BIN_NAME}.exe"
+          $stageDir = "dist\stage-$target"
+
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+          Copy-Item $binPath "$stageDir\${env:BIN_NAME}.exe"
+          Copy-Item README.md "$stageDir\README.md"
+          Copy-Item LICENSE "$stageDir\LICENSE"
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "$stageDir\*" -DestinationPath "dist\$archiveName" -Force
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          for f in *.tar.gz *.zip; do
+            [ -e "$f" ] || continue
+            shasum -a 256 "$f" > "$f.sha256"
+          done
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Collect release files
+        shell: bash
+        run: |
+          mkdir -p upload
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} upload/ \;
+          ls -lh upload
+
+      - name: Determine release metadata
+        id: meta
+        shell: bash
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            PRERELEASE="${{ contains(github.ref_name, '-') && 'true' || 'false' }}"
+            DRAFT="false"
+          else
+            TAG="${{ github.event.inputs.tag }}"
+            PRERELEASE="${{ github.event.inputs.prerelease }}"
+            DRAFT="${{ github.event.inputs.draft }}"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "draft=$DRAFT" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: upload/*
+          draft: ${{ steps.meta.outputs.draft }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
