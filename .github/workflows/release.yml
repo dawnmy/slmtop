@@ -39,23 +39,15 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            archive: tar.gz
 
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            archive: tar.gz
+
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
 
           - os: macos-14
             target: aarch64-apple-darwin
-            archive: tar.gz
-
-          - os: macos-13
-            target: x86_64-apple-darwin
-            archive: tar.gz
-
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
 
     steps:
       - uses: actions/checkout@v4
@@ -81,12 +73,6 @@ jobs:
             brew update
             brew install jq
           fi
-
-      - name: Install Windows dependencies
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          choco install jq -y
 
       - name: Verify Cargo.lock is up to date
         run: cargo metadata --locked --format-version=1 --no-deps > /dev/null
@@ -117,6 +103,7 @@ jobs:
 
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             TAG="${{ github.event.inputs.tag }}"
+
             if [[ ! "$TAG" =~ ^v[0-9]+(\.[0-9]+){1,2}(-.+)?$ ]]; then
               echo "Input tag must look like v0.2.8 or v0.2.8-beta.1"
               exit 1
@@ -133,10 +120,11 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: |
+          rustc --version
+          cargo --version
           cargo build --release --locked --target "${{ matrix.target }}" -p "$PACKAGE_NAME" -vv
 
-      - name: Package Unix binary
-        if: matrix.archive == 'tar.gz'
+      - name: Package binary
         shell: bash
         run: |
           set -euo pipefail
@@ -150,38 +138,22 @@ jobs:
 
           mkdir -p "$STAGE_DIR"
           cp "$BIN_PATH" "$STAGE_DIR/${BIN_NAME}"
-          cp README.md LICENSE "$STAGE_DIR/"
+
+          [ -f README.md ] && cp README.md "$STAGE_DIR/" || true
+          [ -f LICENSE ] && cp LICENSE "$STAGE_DIR/" || true
+          [ -f LICENSE.md ] && cp LICENSE.md "$STAGE_DIR/" || true
+          [ -f CHANGELOG.md ] && cp CHANGELOG.md "$STAGE_DIR/" || true
 
           strip "$STAGE_DIR/${BIN_NAME}" || true
 
           mkdir -p dist
           tar -C "$STAGE_DIR" -czf "dist/${ARCHIVE_NAME}" .
 
-      - name: Package Windows binary
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $ver = "${{ steps.ver.outputs.version }}"
-          $target = "${{ matrix.target }}"
-          $archiveName = "${env:BIN_NAME}-v${ver}-${target}.zip"
-
-          $binPath = "target\$target\release\${env:BIN_NAME}.exe"
-          $stageDir = "dist\stage-$target"
-
-          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
-          Copy-Item $binPath "$stageDir\${env:BIN_NAME}.exe"
-          Copy-Item README.md "$stageDir\README.md"
-          Copy-Item LICENSE "$stageDir\LICENSE"
-
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path "$stageDir\*" -DestinationPath "dist\$archiveName" -Force
-
-      - name: Generate checksums
+      - name: Generate checksum
         shell: bash
         run: |
           cd dist
-          for f in *.tar.gz *.zip; do
-            [ -e "$f" ] || continue
+          for f in *.tar.gz; do
             shasum -a 256 "$f" > "$f.sha256"
           done
 
@@ -191,7 +163,6 @@ jobs:
           name: ${{ matrix.target }}
           path: |
             dist/*.tar.gz
-            dist/*.zip
             dist/*.sha256
 
   release:
@@ -208,7 +179,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p upload
-          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} upload/ \;
+          find dist -type f \( -name '*.tar.gz' -o -name '*.sha256' \) -exec cp {} upload/ \;
           ls -lh upload
 
       - name: Determine release metadata
