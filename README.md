@@ -20,17 +20,16 @@
 - Rust toolchain with Cargo.
 - Slurm CLI commands in `PATH`: `squeue`, `sinfo`, `scontrol`, `scancel`, and optionally `sacct`.
 
+
+## Installation
+
+Download the latest precompiled binary for your platform from the [releases page](https://github.com/dawnmy/slmtop/releases), or build from source as described below.
+
 ## Build And Run
 
 ```bash
 cargo build --release
 ./target/release/slmtop
-```
-
-During development:
-
-```bash
-cargo run -p slmtop
 ```
 
 Useful options:
