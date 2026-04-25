@@ -1,12 +1,12 @@
 # slmtop
 
-`slmtop` is a Rust terminal dashboard for realtime Slurm monitoring. It is inspired by `htop` and `slurm-monitor-top`, and built for Slurm-specific jobs, nodes, GPU resources, and recent accounting data.
-<img width="3444" height="2082" alt="iShot_2026-04-25_16 00 27" src="https://github.com/user-attachments/assets/6ae5cf4c-68d4-400f-9ada-8f1f2365d7a2" />
+`slmtop` is a Rust terminal dashboard for realtime Slurm monitoring. It is inspired by `htop` and `slurm-monitor-top`, and built for Slurm-specific jobs, nodes, GPU resources, disks and recent accounting data.
+<img width="1728" height="1048" alt="image" src="https://github.com/user-attachments/assets/10f1cda4-637f-4ab7-a247-8cef99cc7ad9" />
 
 
 ## Features
 
-- Four focusable TUI panels: jobs, nodes, GPUs/resources, and summary/accounting.
+- Four focusable TUI panels: jobs, nodes, GPUs/resources, disks and summary/accounting.
 - Realtime refresh from Slurm CLI commands with per-command timeouts and structured errors.
 - Sortable tables by keyboard or mouse header click.
 - Search and typed filters per panel, for example `owner=me state=running gpu=a100`.
@@ -36,8 +36,8 @@ cargo run -p slmtop
 Useful options:
 
 ```bash
-slmtop --refresh-interval 2 --command-timeout 5 --accounting-limit 200
-slmtop --user alice
+slmtop --refresh-interval 2 --command-timeout 5 --accounting-limit 200 -T nightowl
+slmtop --user bob
 slmtop --version-only
 ```
 
@@ -46,6 +46,7 @@ slmtop --version-only
 - `q`: quit.
 - `?`: help.
 - `r`: refresh now.
+- `t`: switch theme.
 - `Tab` / `Shift-Tab` or `1`-`4`: change focused panel.
 - Arrow keys or `j` / `k`: move selected row.
 - `s`: cycle sort column for the focused panel.
