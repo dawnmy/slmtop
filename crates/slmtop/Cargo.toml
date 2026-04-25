@@ -1,0 +1,23 @@
+[package]
+name = "slmtop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "slmtop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+slmtop-slurm = { path = "../slmtop-slurm" }
+slmtop-slurm-cli = { path = "../slmtop-slurm-cli" }
+slmtop-tui = { path = "../slmtop-tui" }
+tokio = { version = "=1.48.0", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = "0.3.22"
+
+[lints]
+workspace = true

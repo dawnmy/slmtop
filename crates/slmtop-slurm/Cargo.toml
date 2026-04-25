@@ -1,0 +1,16 @@
+[package]
+name = "slmtop-slurm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+slmtop-core = { path = "../slmtop-core" }
+thiserror = "2.0.18"
+tokio = { version = "=1.48.0", features = ["time"] }
+
+[lints]
+workspace = true

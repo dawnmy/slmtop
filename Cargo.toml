@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/slmtop",
+    "crates/slmtop-core",
+    "crates/slmtop-parsers",
+    "crates/slmtop-slurm",
+    "crates/slmtop-slurm-cli",
+    "crates/slmtop-tui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["slmtop contributors"]
+repository = "https://github.com/dawnmy/slmtop"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
