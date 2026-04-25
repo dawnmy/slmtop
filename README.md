@@ -25,19 +25,41 @@
 
 Download the latest precompiled binary for your platform from the [releases page](https://github.com/dawnmy/slmtop/releases), or build from source as described below.
 
-## Build And Run
-
 ```bash
 cargo build --release
 ./target/release/slmtop
 ```
+
+Help:
+
+```bash
+Realtime Slurm cluster monitor
+
+Usage: slmtop [OPTIONS]
+
+Options:
+  -i, --refresh-interval <REFRESH_INTERVAL>
+          Refresh interval in seconds [default: 3]
+  -t, --command-timeout <COMMAND_TIMEOUT>
+          Per-command timeout in seconds [default: 4]
+  -l, --accounting-limit <ACCOUNTING_LIMIT>
+          Recent sacct rows to keep [default: 100]
+  -u, --user <USER>
+          Override the current username used for owner filters
+  -T, --theme <THEME>
+          Color theme: catppuccin, monokai, tokyonight, dracula, onedark, nightowl, classic [default: catppuccin]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
+
 
 Useful options:
 
 ```bash
 slmtop --refresh-interval 2 --command-timeout 5 --accounting-limit 200 -T nightowl
 slmtop --user bob
-slmtop --version-only
 ```
 
 ## Keybindings
