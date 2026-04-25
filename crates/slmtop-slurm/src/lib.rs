@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use slmtop_core::{AccountingRecord, ClusterSnapshot, Job, Node};
+use slmtop_core::{AccountingRecord, ClusterSnapshot, DiskInfo, Job, Node};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -73,6 +73,12 @@ pub trait SlurmBackend: Send + Sync {
     async fn jobs(&self) -> Result<(Vec<Job>, CommandTelemetry)>;
     async fn nodes(&self) -> Result<(Vec<Node>, CommandTelemetry)>;
     async fn accounting(&self, limit: usize) -> Result<(Vec<AccountingRecord>, CommandTelemetry)>;
+
+    /// Collects disk usage information from the local system.
+    /// Returns an empty list by default so implementations can opt in.
+    async fn disk_info(&self) -> Result<Vec<DiskInfo>> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]
@@ -130,10 +136,11 @@ where
     B: SlurmBackend + ?Sized,
 {
     let started = Instant::now();
-    let (jobs_result, nodes_result, accounting_result) = tokio::join!(
+    let (jobs_result, nodes_result, accounting_result, disk_result) = tokio::join!(
         backend.jobs(),
         backend.nodes(),
-        backend.accounting(config.accounting_limit)
+        backend.accounting(config.accounting_limit),
+        backend.disk_info()
     );
 
     let mut commands = Vec::new();
@@ -148,6 +155,7 @@ where
         }
         Err(error) => (Vec::new(), Some(format!("sacct unavailable: {error}"))),
     };
+    let disk_info = disk_result.unwrap_or_default();
 
     let mut warnings = Vec::new();
     for command in &commands {
@@ -158,7 +166,14 @@ where
     }
 
     Ok(SnapshotEnvelope {
-        snapshot: ClusterSnapshot::new(jobs, nodes, accounting, &config.current_user, warnings),
+        snapshot: ClusterSnapshot::new(
+            jobs,
+            nodes,
+            accounting,
+            disk_info,
+            &config.current_user,
+            warnings,
+        ),
         telemetry: SnapshotTelemetry {
             elapsed: started.elapsed(),
             commands,

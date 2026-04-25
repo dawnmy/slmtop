@@ -4,8 +4,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use slmtop_core::{AccountingRecord, Job, Node};
-use slmtop_parsers::{parse_sacct, parse_sinfo, parse_squeue};
+use slmtop_core::{AccountingRecord, DiskInfo, Job, Node};
+use slmtop_parsers::{parse_df, parse_sacct, parse_sinfo, parse_squeue};
 use slmtop_slurm::{CommandTelemetry, JobControl, Result, SlurmBackend, SlurmError};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -89,7 +89,7 @@ impl SlurmBackend for CliSlurmBackend {
         let output = self
             .run(
                 "squeue",
-                &["-a", "-h", "-o", "%i|%u|%T|%P|%j|%D|%C|%m|%b|%M|%R"],
+                &["-a", "-h", "-o", "%i|%u|%T|%P|%j|%D|%C|%m|%b|%M|%N|%R"],
                 false,
             )
             .await?;
@@ -103,7 +103,12 @@ impl SlurmBackend for CliSlurmBackend {
         let output = self
             .run(
                 "sinfo",
-                &["-N", "-h", "-o", "%n|%t|%c|%C|%m|%e|%G|%E"],
+                &[
+                    "-N",
+                    "-h",
+                    "-O",
+                    "NodeHost:|,StateCompact:|,CPUs:|,CPUsState:|,Memory:|,FreeMem:|,Gres:|,Reason:|,GresUsed:500",
+                ],
                 false,
             )
             .await?;
@@ -133,6 +138,17 @@ impl SlurmBackend for CliSlurmBackend {
         let mut telemetry = output.telemetry;
         telemetry.warnings.extend(parsed.warnings);
         Ok((parsed.rows, telemetry))
+    }
+
+    async fn disk_info(&self) -> Result<Vec<DiskInfo>> {
+        let output = self
+            .run(
+                "df",
+                &["-h", "--output=source,fstype,size,used,avail,pcent,target"],
+                true,
+            )
+            .await?;
+        Ok(parse_df(&output.stdout))
     }
 }
 

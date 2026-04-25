@@ -19,9 +19,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
 use slmtop_core::{
-    bucket_display, filter_accounting, filter_jobs, filter_nodes, sort_accounting, sort_jobs,
-    sort_nodes, AccountingColumn, AccountingRecord, ClusterSnapshot, FilterExpression, GpuSummary,
-    Job, JobColumn, Node, NodeColumn, PanelId, SortDirection,
+    filter_jobs, filter_nodes, sort_jobs, sort_nodes, AccountingColumn,
+    ClusterSnapshot, FilterExpression, GpuSummary, Job, JobColumn, Node, NodeColumn, PanelId,
+    SortDirection,
 };
 use slmtop_slurm::{refresh_backend, BackendConfig, SlurmClient, SlurmError, SnapshotEnvelope};
 use thiserror::Error;
@@ -40,15 +40,294 @@ pub enum TuiError {
 
 pub type Result<T> = std::result::Result<T, TuiError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeName {
+    Catppuccin,
+    TokyoNight,
+    Dracula,
+    OneDarkPro,
+    Monokai,
+    NightOwl,
+    Classic,
+}
+
+impl ThemeName {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "monokai" => Self::Monokai,
+            "catppuccin" => Self::Catppuccin,
+            "onedark" | "onedarkpro" => Self::OneDarkPro,
+            "nightowl" | "night_owl" => Self::NightOwl,
+            "tokyonight" | "tokyo_night" => Self::TokyoNight,
+            "dracula" => Self::Dracula,
+            "classic" => Self::Classic,
+            _ => Self::Catppuccin, // Default theme
+        }
+    }
+
+    const ALL: [Self; 7] = [
+        Self::Catppuccin,
+        Self::TokyoNight,
+        Self::Dracula,
+        Self::OneDarkPro,
+        Self::Monokai,
+        Self::NightOwl,
+        Self::Classic,
+    ];
+
+    fn cycle(self) -> Self {
+        let idx = Self::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::Monokai => "Monokai",
+            Self::Catppuccin => "Catppuccin Mocha",
+            Self::OneDarkPro => "One Dark Pro",
+            Self::NightOwl => "Night Owl",
+            Self::TokyoNight => "Tokyo Night",
+            Self::Dracula => "Dracula",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Theme {
+    border_focused: Style,
+    border_unfocused: Style,
+    header_style: Style,
+    highlight: Style,
+    status_badge: Style,
+    state_running: Style,
+    state_pending: Style,
+    state_failed: Style,
+    node_idle: Style,
+    node_down: Style,
+    node_mixed: Style,
+    summary_all: Style,
+    summary_me: Style,
+    summary_others: Style,
+    _bar_filled: Color,
+    _bar_empty: Color,
+    warning_border: Style,
+}
+
+impl Theme {
+    fn from_name(name: ThemeName) -> Self {
+        match name {
+            ThemeName::Classic => Self::classic(),
+            ThemeName::Monokai => Self::monokai(),
+            ThemeName::Catppuccin => Self::catppuccin(),
+            ThemeName::OneDarkPro => Self::onedark(),
+            ThemeName::NightOwl => Self::nightowl(),
+            ThemeName::TokyoNight => Self::tokyonight(),
+            ThemeName::Dracula => Self::dracula(),
+        }
+    }
+
+    fn classic() -> Self {
+        Self {
+            border_focused: Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            border_unfocused: Style::default().fg(Color::DarkGray),
+            header_style: Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            highlight: Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            status_badge: Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            state_running: Style::default().fg(Color::Green),
+            state_pending: Style::default().fg(Color::Yellow),
+            state_failed: Style::default().fg(Color::Red),
+            node_idle: Style::default().fg(Color::Green),
+            node_down: Style::default().fg(Color::Red),
+            node_mixed: Style::default().fg(Color::Yellow),
+            summary_all: Style::default().fg(Color::Cyan),
+            summary_me: Style::default().fg(Color::Green),
+            summary_others: Style::default().fg(Color::Yellow),
+            _bar_filled: Color::Cyan,
+            _bar_empty: Color::DarkGray,
+            warning_border: Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn monokai() -> Self {
+        let green = Color::Rgb(166, 226, 46);
+        let orange = Color::Rgb(253, 151, 31);
+        let magenta = Color::Rgb(249, 38, 114);
+        let cyan = Color::Rgb(102, 217, 239);
+        let bg_sel = Color::Rgb(73, 72, 62);
+        Self {
+            border_focused: Style::default().fg(cyan).add_modifier(Modifier::BOLD),
+            border_unfocused: Style::default().fg(Color::Rgb(117, 113, 94)),
+            header_style: Style::default().fg(Color::Black).bg(cyan).add_modifier(Modifier::BOLD),
+            highlight: Style::default().bg(bg_sel).add_modifier(Modifier::BOLD),
+            status_badge: Style::default().fg(Color::Black).bg(green).add_modifier(Modifier::BOLD),
+            state_running: Style::default().fg(green),
+            state_pending: Style::default().fg(orange),
+            state_failed: Style::default().fg(magenta),
+            node_idle: Style::default().fg(green),
+            node_down: Style::default().fg(magenta),
+            node_mixed: Style::default().fg(orange),
+            summary_all: Style::default().fg(cyan),
+            summary_me: Style::default().fg(green),
+            summary_others: Style::default().fg(orange),
+            _bar_filled: green,
+            _bar_empty: Color::Rgb(73, 72, 62),
+            warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn catppuccin() -> Self {
+        let mauve = Color::Rgb(203, 166, 247);
+        let green = Color::Rgb(166, 227, 161);
+        let peach = Color::Rgb(250, 179, 135);
+        let red = Color::Rgb(243, 139, 168);
+        let teal = Color::Rgb(148, 226, 213);
+        let surface1 = Color::Rgb(69, 71, 90);
+        Self {
+            border_focused: Style::default().fg(mauve).add_modifier(Modifier::BOLD),
+            border_unfocused: Style::default().fg(surface1),
+            header_style: Style::default().fg(Color::Rgb(30, 30, 46)).bg(mauve).add_modifier(Modifier::BOLD),
+            highlight: Style::default().bg(surface1).add_modifier(Modifier::BOLD),
+            status_badge: Style::default().fg(Color::Rgb(30, 30, 46)).bg(mauve).add_modifier(Modifier::BOLD),
+            state_running: Style::default().fg(green),
+            state_pending: Style::default().fg(peach),
+            state_failed: Style::default().fg(red),
+            node_idle: Style::default().fg(green),
+            node_down: Style::default().fg(red),
+            node_mixed: Style::default().fg(peach),
+            summary_all: Style::default().fg(teal),
+            summary_me: Style::default().fg(green),
+            summary_others: Style::default().fg(peach),
+            _bar_filled: teal,
+            _bar_empty: surface1,
+            warning_border: Style::default().fg(peach).add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn onedark() -> Self {
+        let blue = Color::Rgb(97, 175, 239);
+        let green = Color::Rgb(152, 195, 121);
+        let orange = Color::Rgb(209, 154, 102);
+        let red = Color::Rgb(224, 108, 117);
+        let purple = Color::Rgb(198, 120, 221);
+        let gutter = Color::Rgb(76, 82, 99);
+        Self {
+            border_focused: Style::default().fg(blue).add_modifier(Modifier::BOLD),
+            border_unfocused: Style::default().fg(gutter),
+            header_style: Style::default().fg(Color::Rgb(40, 44, 52)).bg(blue).add_modifier(Modifier::BOLD),
+            highlight: Style::default().bg(gutter).add_modifier(Modifier::BOLD),
+            status_badge: Style::default().fg(Color::Rgb(40, 44, 52)).bg(blue).add_modifier(Modifier::BOLD),
+            state_running: Style::default().fg(green),
+            state_pending: Style::default().fg(orange),
+            state_failed: Style::default().fg(red),
+            node_idle: Style::default().fg(green),
+            node_down: Style::default().fg(red),
+            node_mixed: Style::default().fg(orange),
+            summary_all: Style::default().fg(purple),
+            summary_me: Style::default().fg(green),
+            summary_others: Style::default().fg(orange),
+            _bar_filled: blue,
+            _bar_empty: gutter,
+            warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn nightowl() -> Self {
+        let cyan = Color::Rgb(127, 219, 202);
+        let orange = Color::Rgb(239, 143, 82);
+        let yellow = Color::Rgb(255, 203, 107);
+        let red = Color::Rgb(239, 83, 80);
+        let blue = Color::Rgb(130, 170, 255);
+        let surface = Color::Rgb(30, 50, 80);
+        Self {
+            border_focused: Style::default().fg(cyan).add_modifier(Modifier::BOLD),
+            border_unfocused: Style::default().fg(Color::Rgb(68, 98, 130)),
+            header_style: Style::default().fg(Color::Rgb(1, 22, 39)).bg(cyan).add_modifier(Modifier::BOLD),
+            highlight: Style::default().bg(surface).add_modifier(Modifier::BOLD),
+            status_badge: Style::default().fg(Color::Rgb(1, 22, 39)).bg(cyan).add_modifier(Modifier::BOLD),
+            state_running: Style::default().fg(cyan),
+            state_pending: Style::default().fg(yellow),
+            state_failed: Style::default().fg(red),
+            node_idle: Style::default().fg(cyan),
+            node_down: Style::default().fg(red),
+            node_mixed: Style::default().fg(yellow),
+            summary_all: Style::default().fg(blue),
+            summary_me: Style::default().fg(cyan),
+            summary_others: Style::default().fg(orange),
+            _bar_filled: cyan,
+            _bar_empty: surface,
+            warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn tokyonight() -> Self {
+        let blue = Color::Rgb(122, 162, 247);
+        let green = Color::Rgb(158, 206, 106);
+        let orange = Color::Rgb(255, 158, 100);
+        let red = Color::Rgb(247, 118, 142);
+        let purple = Color::Rgb(187, 154, 247);
+        let bg_highlight = Color::Rgb(41, 46, 66);
+        Self {
+            border_focused: Style::default().fg(blue).add_modifier(Modifier::BOLD),
+            border_unfocused: Style::default().fg(bg_highlight),
+            header_style: Style::default().fg(Color::Rgb(26, 27, 38)).bg(blue).add_modifier(Modifier::BOLD),
+            highlight: Style::default().bg(bg_highlight).add_modifier(Modifier::BOLD),
+            status_badge: Style::default().fg(Color::Rgb(26, 27, 38)).bg(blue).add_modifier(Modifier::BOLD),
+            state_running: Style::default().fg(green),
+            state_pending: Style::default().fg(orange),
+            state_failed: Style::default().fg(red),
+            node_idle: Style::default().fg(green),
+            node_down: Style::default().fg(red),
+            node_mixed: Style::default().fg(orange),
+            summary_all: Style::default().fg(purple),
+            summary_me: Style::default().fg(green),
+            summary_others: Style::default().fg(orange),
+            _bar_filled: blue,
+            _bar_empty: bg_highlight,
+            warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
+        }
+    }
+
+    fn dracula() -> Self {
+        let purple = Color::Rgb(189, 147, 249);
+        let green = Color::Rgb(80, 250, 123);
+        let orange = Color::Rgb(255, 184, 108);
+        let red = Color::Rgb(255, 85, 85);
+        let cyan = Color::Rgb(139, 233, 253);
+        let bg_highlight = Color::Rgb(68, 71, 90);
+        Self {
+            border_focused: Style::default().fg(purple).add_modifier(Modifier::BOLD),
+            border_unfocused: Style::default().fg(bg_highlight),
+            header_style: Style::default().fg(Color::Rgb(40, 42, 54)).bg(purple).add_modifier(Modifier::BOLD),
+            highlight: Style::default().bg(bg_highlight).add_modifier(Modifier::BOLD),
+            status_badge: Style::default().fg(Color::Rgb(40, 42, 54)).bg(purple).add_modifier(Modifier::BOLD),
+            state_running: Style::default().fg(green),
+            state_pending: Style::default().fg(orange),
+            state_failed: Style::default().fg(red),
+            node_idle: Style::default().fg(green),
+            node_down: Style::default().fg(red),
+            node_mixed: Style::default().fg(orange),
+            summary_all: Style::default().fg(cyan),
+            summary_me: Style::default().fg(green),
+            summary_others: Style::default().fg(orange),
+            _bar_filled: cyan,
+            _bar_empty: bg_highlight,
+            warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TuiOptions {
     pub tick_rate: Duration,
+    pub theme: ThemeName,
 }
 
 impl Default for TuiOptions {
     fn default() -> Self {
         Self {
             tick_rate: Duration::from_millis(80),
+            theme: ThemeName::Catppuccin,
         }
     }
 }
@@ -81,7 +360,7 @@ where
 {
     let (tx, mut rx) = mpsc::channel(16);
     spawn_refresh_loop(Arc::clone(backend), config.clone(), tx.clone());
-    let mut app = AppState::new(config.current_user.clone(), config.refresh_interval);
+    let mut app = AppState::new(config.current_user.clone(), config.refresh_interval, options.theme);
 
     loop {
         while let Ok(message) = rx.try_recv() {
@@ -292,31 +571,37 @@ struct AppState {
     input: String,
     show_help: bool,
     details_job: Option<String>,
+    details_node: Option<String>,
     pending_action: Option<PendingAction>,
     left_percent: u16,
     top_percent: u16,
-    panels: [PanelUiState; 4],
+    panels: [PanelUiState; 5],
     jobs_sort: JobColumn,
     nodes_sort: NodeColumn,
     gpu_sort: GpuColumn,
     accounting_sort: AccountingColumn,
-    directions: [SortDirection; 4],
+    directions: [SortDirection; 5],
     jobs_table: TableState,
     nodes_table: TableState,
     gpus_table: TableState,
+    disks_table: TableState,
     summary_table: TableState,
-    panel_areas: [Option<Rect>; 4],
+    panel_areas: [Option<Rect>; 5],
     header_hits: Vec<HeaderHit>,
+    theme_name: ThemeName,
+    theme: Theme,
 }
 
 impl AppState {
-    fn new(current_user: String, refresh_interval: Duration) -> Self {
+    fn new(current_user: String, refresh_interval: Duration, theme_name: ThemeName) -> Self {
         let mut jobs_table = TableState::default();
         jobs_table.select(Some(0));
         let mut nodes_table = TableState::default();
         nodes_table.select(Some(0));
         let mut gpus_table = TableState::default();
         gpus_table.select(Some(0));
+        let mut disks_table = TableState::default();
+        disks_table.select(Some(0));
         let mut summary_table = TableState::default();
         summary_table.select(Some(0));
         Self {
@@ -330,26 +615,31 @@ impl AppState {
             input: String::new(),
             show_help: false,
             details_job: None,
+            details_node: None,
             pending_action: None,
-            left_percent: 62,
+            left_percent: 55,
             top_percent: 68,
             panels: [
                 PanelUiState::new(10),
-                PanelUiState::new(9),
+                PanelUiState::new(8),
                 PanelUiState::new(5),
+                PanelUiState::new(3), // Disks
                 PanelUiState::new(8),
             ],
             jobs_sort: JobColumn::State,
             nodes_sort: NodeColumn::State,
             gpu_sort: GpuColumn::Type,
             accounting_sort: AccountingColumn::JobId,
-            directions: [SortDirection::Asc; 4],
+            directions: [SortDirection::Asc; 5],
             jobs_table,
             nodes_table,
             gpus_table,
+            disks_table,
             summary_table,
-            panel_areas: [None, None, None, None],
+            panel_areas: [None, None, None, None, None],
             header_hits: Vec::new(),
+            theme_name,
+            theme: Theme::from_name(theme_name),
         }
     }
 
@@ -399,7 +689,7 @@ impl AppState {
             let block = Block::default()
                 .title("slmtop")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_style(self.theme.border_focused);
             let paragraph = Paragraph::new("Waiting for Slurm data...")
                 .block(block)
                 .style(Style::default().fg(Color::Gray));
@@ -408,18 +698,22 @@ impl AppState {
             self.draw_jobs(frame);
             self.draw_nodes(frame);
             self.draw_gpus(frame);
+            self.draw_disks(frame);
             self.draw_summary(frame);
         }
 
         self.draw_status(frame, vertical[1]);
         if self.show_help {
-            Self::draw_help(frame, centered_rect(74, 70, root));
+            self.draw_help(frame, centered_rect(74, 70, root));
         }
         if let Some(job_id) = self.details_job.clone() {
             self.draw_job_details(frame, &job_id, centered_rect(78, 62, root));
         }
+        if let Some(node_name) = self.details_node.clone() {
+            self.draw_node_details(frame, &node_name, centered_rect(72, 55, root));
+        }
         if let Some(pending) = self.pending_action.clone() {
-            Self::draw_confirmation(frame, &pending, centered_rect(62, 24, root));
+            self.draw_confirmation(frame, &pending, centered_rect(62, 28, root));
         }
         if self.mode != InputMode::Normal {
             self.draw_input(frame, centered_rect(70, 15, root));
@@ -435,7 +729,10 @@ impl AppState {
         let headers = [
             "JOBID", "USER", "STATE", "PART", "NAME", "NODES", "CPUS", "GPUS", "MEM", "TIME",
         ];
+        let sort_idx = job_column_to_index(self.jobs_sort);
+        let direction = self.directions[PanelId::Jobs.index()];
         let visible = self.visible_columns(PanelId::Jobs, headers.len());
+        let theme = self.theme;
         let table_rows = rows.iter().map(|job| {
             let values = [
                 job.id.clone(),
@@ -449,27 +746,40 @@ impl AppState {
                 job.memory.to_string(),
                 job.time_used.clone(),
             ];
-            Row::new(select_visible(values, &visible)).style(state_style(&job.state))
+            Row::new(select_visible(values, &visible)).style(themed_state_style(&theme, &job.state))
         });
-        self.add_header_hits(area, PanelId::Jobs, visible.len());
+        let mut constraints = Vec::new();
+        for (i, &is_visible) in visible.iter().enumerate() {
+            if is_visible {
+                constraints.push(match headers[i] {
+                    "JOBID" => Constraint::Percentage(10),
+                    "USER" => Constraint::Percentage(10),
+                    "STATE" => Constraint::Percentage(10),
+                    "PART" => Constraint::Percentage(8),
+                    "NAME" => Constraint::Percentage(18),
+                    "NODES" => Constraint::Percentage(8),
+                    "CPUS" => Constraint::Percentage(6),
+                    "GPUS" => Constraint::Percentage(6),
+                    "MEM" => Constraint::Percentage(8),
+                    "TIME" => Constraint::Percentage(10),
+                    _ => Constraint::Percentage(10),
+                });
+            }
+        }
+        self.add_header_hits(area, PanelId::Jobs, &constraints);
         let title = self.panel_title(
             PanelId::Jobs,
             format!(
-                "sort={:?} {:?} rows={} filter={}",
-                self.jobs_sort,
-                self.directions[PanelId::Jobs.index()],
+                "rows={} filter={}",
                 rows.len(),
                 filter_label(&self.panels[PanelId::Jobs.index()].filter)
             ),
         );
-        let table = Table::new(table_rows, equal_widths(visible.len()))
-            .header(Row::new(select_visible(headers, &visible)).style(header_style()))
-            .block(panel_block(title, self.focus == PanelId::Jobs))
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+        let header_cells = decorate_headers(&headers, sort_idx, direction, &visible);
+        let table = Table::new(table_rows, constraints)
+            .header(Row::new(header_cells).style(self.theme.header_style))
+            .block(self.themed_panel_block(title, self.focus == PanelId::Jobs))
+            .row_highlight_style(self.theme.highlight);
         frame.render_stateful_widget(table, area, &mut self.jobs_table);
     }
 
@@ -480,42 +790,52 @@ impl AppState {
         let rows = self.visible_nodes();
         clamp_selection(&mut self.nodes_table, rows.len());
         let headers = [
-            "NODE", "STATE", "CPU(T)", "CPU(A)", "CPU(I)", "MEM(T)", "MEM(R)", "MEM(F)", "GPU",
+            "NODE", "STATE", "CPU(T)", "CPU(F)", "MEM(T)", "MEM(F)", "GPU(T)", "GPU(F)"
         ];
+        let sort_idx = node_column_to_index(self.nodes_sort);
+        let direction = self.directions[PanelId::Nodes.index()];
         let visible = self.visible_columns(PanelId::Nodes, headers.len());
+        let theme = self.theme;
         let table_rows = rows.iter().map(|node| {
             let values = [
                 node.name.clone(),
                 node.state.clone(),
                 node.cpus.total.to_string(),
-                node.cpus.allocated.to_string(),
                 node.cpus.idle.to_string(),
                 node.memory_total.to_string(),
-                node.memory_reserved.to_string(),
                 node.memory_free.to_string(),
                 node.gpu_total().to_string(),
+                (node.gpu_total().saturating_sub(node.gpu_allocated())).to_string(),
             ];
-            Row::new(select_visible(values, &visible)).style(node_style(&node.state))
+            Row::new(select_visible(values, &visible)).style(themed_node_style(&theme, &node.state))
         });
-        self.add_header_hits(area, PanelId::Nodes, visible.len());
+        let mut constraints = Vec::new();
+        for (i, &is_visible) in visible.iter().enumerate() {
+            if is_visible {
+                constraints.push(match headers[i] {
+                    "NODE" => Constraint::Percentage(20),
+                    "STATE" => Constraint::Percentage(10),
+                    "CPU(T)" | "CPU(F)" => Constraint::Percentage(10),
+                    "MEM(T)" | "MEM(F)" => Constraint::Percentage(10),
+                    "GPU(T)" | "GPU(F)" => Constraint::Percentage(10),
+                    _ => Constraint::Percentage(10),
+                });
+            }
+        }
+        self.add_header_hits(area, PanelId::Nodes, &constraints);
         let title = self.panel_title(
             PanelId::Nodes,
             format!(
-                "sort={:?} {:?} rows={} filter={}",
-                self.nodes_sort,
-                self.directions[PanelId::Nodes.index()],
+                "rows={} filter={}",
                 rows.len(),
                 filter_label(&self.panels[PanelId::Nodes.index()].filter)
             ),
         );
-        let table = Table::new(table_rows, equal_widths(visible.len()))
-            .header(Row::new(select_visible(headers, &visible)).style(header_style()))
-            .block(panel_block(title, self.focus == PanelId::Nodes))
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+        let header_cells = decorate_headers(&headers, sort_idx, direction, &visible);
+        let table = Table::new(table_rows, constraints)
+            .header(Row::new(header_cells).style(self.theme.header_style))
+            .block(self.themed_panel_block(title, self.focus == PanelId::Nodes))
+            .row_highlight_style(self.theme.highlight);
         frame.render_stateful_widget(table, area, &mut self.nodes_table);
     }
 
@@ -526,6 +846,8 @@ impl AppState {
         let rows = self.gpu_rows();
         clamp_selection(&mut self.gpus_table, rows.len());
         let headers = ["TYPE", "TOTAL", "ACTIVE", "RESERVED", "FREE"];
+        let sort_idx = gpu_column_to_index(self.gpu_sort);
+        let direction = self.directions[PanelId::Gpus.index()];
         let visible = self.visible_columns(PanelId::Gpus, headers.len());
         let table_rows = rows.iter().map(|row| {
             let values = [
@@ -537,96 +859,145 @@ impl AppState {
             ];
             Row::new(select_visible(values, &visible))
         });
-        self.add_header_hits(area, PanelId::Gpus, visible.len());
-        let title = self.panel_title(
-            PanelId::Gpus,
-            format!(
-                "sort={:?} {:?} rows={}",
-                self.gpu_sort,
-                self.directions[PanelId::Gpus.index()],
-                rows.len()
-            ),
-        );
-        let table = Table::new(table_rows, equal_widths(visible.len()))
-            .header(Row::new(select_visible(headers, &visible)).style(header_style()))
-            .block(panel_block(title, self.focus == PanelId::Gpus))
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+        let constraints = equal_widths(visible.len());
+        self.add_header_hits(area, PanelId::Gpus, &constraints);
+        let title = self.panel_title(PanelId::Gpus, format!("rows={}", rows.len()));
+        let header_cells = decorate_headers(&headers, sort_idx, direction, &visible);
+        let table = Table::new(table_rows, constraints)
+            .header(Row::new(header_cells).style(self.theme.header_style))
+            .block(self.themed_panel_block(title, self.focus == PanelId::Gpus))
+            .row_highlight_style(self.theme.highlight);
         frame.render_stateful_widget(table, area, &mut self.gpus_table);
+    }
+
+    fn draw_disks(&mut self, frame: &mut Frame<'_>) {
+        let Some(area) = self.panel_areas[PanelId::Disks.index()] else {
+            return;
+        };
+        let mut disks = self.snapshot.as_ref().map_or_else(Vec::new, |s| s.snapshot.disk_info.clone());
+        disks.sort_by(|a, b| {
+            let parse_size = |s: &str| -> f64 {
+                let num_str: String = s.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+                let num: f64 = num_str.parse().unwrap_or(0.0);
+                if s.ends_with('K') { num * 1024.0 }
+                else if s.ends_with('M') { num * 1024.0 * 1024.0 }
+                else if s.ends_with('G') { num * 1024.0 * 1024.0 * 1024.0 }
+                else if s.ends_with('T') { num * 1024.0 * 1024.0 * 1024.0 * 1024.0 }
+                else if s.ends_with('P') { num * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 }
+                else { num }
+            };
+            parse_size(&b.size).partial_cmp(&parse_size(&a.size)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        clamp_selection(&mut self.disks_table, disks.len());
+        let mut table_rows: Vec<Row<'static>> = Vec::new();
+        let bar_width = 12_usize;
+        for disk in &disks {
+            let filled = (usize::from(disk.use_percent) * bar_width) / 100;
+            let empty = bar_width.saturating_sub(filled);
+            
+            let color = match disk.label {
+                slmtop_core::DiskLabel::Ssd => Color::LightGreen,
+                slmtop_core::DiskLabel::Hdd => Color::LightYellow,
+                slmtop_core::DiskLabel::Nfs => Color::LightBlue,
+                slmtop_core::DiskLabel::ParallelFs => Color::LightCyan,
+                slmtop_core::DiskLabel::Unknown => Color::Gray,
+            };
+
+            let bar_text = format!(
+                "[{}{}] {:>3}%",
+                "█".repeat(filled),
+                " ".repeat(empty),
+                disk.use_percent
+            );
+            table_rows.push(Row::new(vec![
+                Cell::from(Line::from(Span::styled(bar_text, Style::default().fg(color)))),
+                Cell::from(disk.mount.clone()),
+                Cell::from(disk.label.as_str()),
+                Cell::from(format!("{}/{}", disk.used, disk.size)),
+            ]));
+        }
+        let title = self.panel_title(PanelId::Disks, format!("disks={}", disks.len()));
+        let headers = ["USAGE", "PATH", "TYPE", "SPACE"];
+        let constraints = vec![
+            Constraint::Length(20),
+            Constraint::Percentage(40),
+            Constraint::Length(6),
+            Constraint::Percentage(40),
+        ];
+        let table = Table::new(table_rows, constraints)
+            .header(Row::new(headers.map(Cell::from)).style(self.theme.header_style))
+            .block(self.themed_panel_block(title, self.focus == PanelId::Disks))
+            .row_highlight_style(self.theme.highlight);
+        frame.render_stateful_widget(table, area, &mut self.disks_table);
     }
 
     fn draw_summary(&mut self, frame: &mut Frame<'_>) {
         let Some(area) = self.panel_areas[PanelId::Summary.index()] else {
             return;
         };
-        let rows = self.visible_accounting();
-        clamp_selection(&mut self.summary_table, rows.len() + 3);
+        let summary_rows = 3_usize;
+        clamp_selection(&mut self.summary_table, summary_rows);
         let headers = [
-            "JOBID", "USER", "STATE", "PART", "CPUS", "MEM", "ELAPSED", "END",
+            "", "R-JOBS", "R-CPUs", "R-GPUs", "│", "P-JOBS", "P-CPUs", "P-GPUs"
         ];
-        let visible = self.visible_columns(PanelId::Summary, headers.len());
-        let mut table_rows = Vec::new();
+        let mut table_rows: Vec<Row<'static>> = Vec::new();
         if let Some(snapshot) = self.snapshot.as_ref() {
             let summary = &snapshot.snapshot.job_summary;
             table_rows.push(
                 Row::new(vec![
                     Cell::from("All"),
-                    Cell::from(bucket_display(&summary.all.running)),
-                    Cell::from(bucket_display(&summary.all.pending)),
+                    Cell::from(summary.all.running.jobs.to_string()),
+                    Cell::from(summary.all.running.cpus.to_string()),
+                    Cell::from(summary.all.running.gpus.to_string()),
+                    Cell::from("│"),
+                    Cell::from(summary.all.pending.jobs.to_string()),
+                    Cell::from(summary.all.pending.cpus.to_string()),
+                    Cell::from(summary.all.pending.gpus.to_string()),
                 ])
-                .style(Style::default().fg(Color::Cyan)),
+                .style(self.theme.summary_all),
             );
             table_rows.push(
                 Row::new(vec![
                     Cell::from("Me"),
-                    Cell::from(bucket_display(&summary.me.running)),
-                    Cell::from(bucket_display(&summary.me.pending)),
+                    Cell::from(summary.me.running.jobs.to_string()),
+                    Cell::from(summary.me.running.cpus.to_string()),
+                    Cell::from(summary.me.running.gpus.to_string()),
+                    Cell::from("│"),
+                    Cell::from(summary.me.pending.jobs.to_string()),
+                    Cell::from(summary.me.pending.cpus.to_string()),
+                    Cell::from(summary.me.pending.gpus.to_string()),
                 ])
-                .style(Style::default().fg(Color::Green)),
+                .style(self.theme.summary_me),
             );
             table_rows.push(
                 Row::new(vec![
                     Cell::from("Others"),
-                    Cell::from(bucket_display(&summary.others.running)),
-                    Cell::from(bucket_display(&summary.others.pending)),
+                    Cell::from(summary.others.running.jobs.to_string()),
+                    Cell::from(summary.others.running.cpus.to_string()),
+                    Cell::from(summary.others.running.gpus.to_string()),
+                    Cell::from("│"),
+                    Cell::from(summary.others.pending.jobs.to_string()),
+                    Cell::from(summary.others.pending.cpus.to_string()),
+                    Cell::from(summary.others.pending.gpus.to_string()),
                 ])
-                .style(Style::default().fg(Color::Yellow)),
+                .style(self.theme.summary_others),
             );
         }
-        table_rows.extend(rows.iter().map(|row| {
-            let values = [
-                row.job_id.clone(),
-                row.user.clone(),
-                row.state.clone(),
-                row.partition.clone(),
-                row.cpus.to_string(),
-                row.memory.to_string(),
-                row.elapsed.clone(),
-                row.end.clone(),
-            ];
-            Row::new(select_visible(values, &visible))
-        }));
-        self.add_header_hits(area, PanelId::Summary, visible.len());
-        let title = self.panel_title(
-            PanelId::Summary,
-            format!(
-                "running/pending + sacct sort={:?} {:?} rows={}",
-                self.accounting_sort,
-                self.directions[PanelId::Summary.index()],
-                rows.len()
-            ),
-        );
-        let table = Table::new(table_rows, equal_widths(visible.len().max(3)))
-            .header(Row::new(select_visible(headers, &visible)).style(header_style()))
-            .block(panel_block(title, self.focus == PanelId::Summary))
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+        let title = self.panel_title(PanelId::Summary, "job stats");
+        let constraints = vec![
+            Constraint::Length(8),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+            Constraint::Length(1),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+        ];
+        let table = Table::new(table_rows, constraints)
+            .header(Row::new(headers.map(Cell::from)).style(self.theme.header_style))
+            .block(self.themed_panel_block(title, self.focus == PanelId::Summary))
+            .row_highlight_style(self.theme.highlight);
         frame.render_stateful_widget(table, area, &mut self.summary_table);
     }
 
@@ -641,10 +1012,10 @@ impl AppState {
             .as_ref()
             .map_or(String::new(), |error| format!(" | warning: {error}"));
         let text = Line::from(vec![
-            Span::styled(" slmtop ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" slmtop ", self.theme.status_badge),
             Span::raw(format!(
-                " {mode} focus={} | Tab focus  / search  f filter  s sort  d dir  c column  x hide  v show  [] resize  ? help  q quit | {}{}",
-                self.focus.title(), self.status, error
+                " {mode} focus={} theme={} | Tab / s d f c x v [] t ? q | {}{}",
+                self.focus.title(), self.theme_name.label(), self.status, error
             )),
         ]);
         frame.render_widget(
@@ -653,22 +1024,22 @@ impl AppState {
         );
     }
 
-    fn draw_help(frame: &mut Frame<'_>, area: Rect) {
+    fn draw_help(&self, frame: &mut Frame<'_>, area: Rect) {
         frame.render_widget(Clear, area);
         let text = vec![
             Line::from("slmtop help"),
-            Line::from("Tab/Shift-Tab or 1-4: focus panels. Arrow keys: move selected row."),
-            Line::from("s: cycle sort column, d: toggle direction, mouse-click table headers to sort."),
-            Line::from("/: search focused panel, f: typed filters like owner=me state=running gpu=a100."),
-            Line::from("c: hide/show the next optional column in the focused panel."),
-            Line::from("x: hide focused panel, v: show next hidden panel, [ ] resize width, { } resize height."),
-            Line::from("Enter on a job: details. In details: c cancel, h hold, u release, r requeue, Esc close."),
-            Line::from("? or Esc: close this help."),
+            Line::from("Tab/Shift-Tab or 1-4: focus panels. Arrow keys or j/k: move row."),
+            Line::from("s: cycle sort column, d: toggle direction, click header to sort."),
+            Line::from("/: search, f: filter (owner=me state=running gpu=a100)."),
+            Line::from("c: toggle column, x: hide panel, v: show panel, [ ] { } resize."),
+            Line::from("Enter on job: details (c cancel, h hold, u release, r requeue)."),
+            Line::from("Enter on node: node specs popup."),
+            Line::from("t: cycle theme, ? or Esc: close help, q: quit."),
         ];
         frame.render_widget(
             Paragraph::new(text)
                 .wrap(Wrap { trim: true })
-                .block(panel_block("Help".to_string(), true)),
+                .block(self.themed_panel_block("Help".to_string(), true)),
             area,
         );
     }
@@ -690,7 +1061,7 @@ impl AppState {
             Line::from(help),
         ];
         frame.render_widget(
-            Paragraph::new(text).block(panel_block(prompt.to_string(), true)),
+            Paragraph::new(text).block(self.themed_panel_block(prompt.to_string(), true)),
             area,
         );
     }
@@ -709,40 +1080,62 @@ impl AppState {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let lines = vec![
+        let mut lines = vec![
             Line::from(format!("Job ID    : {}", job.id)),
             Line::from(format!("User      : {}", job.user)),
             Line::from(format!("State     : {}", job.state)),
             Line::from(format!("Partition : {}", job.partition)),
             Line::from(format!("Name      : {}", job.name)),
             Line::from(format!("Nodes     : {}", job.nodes)),
+        ];
+        if !job.node_list.is_empty() {
+            lines.push(Line::from(format!("Node List : {}", job.node_list)));
+        }
+        lines.extend([
             Line::from(format!("CPUs      : {}", job.cpus)),
             Line::from(format!("GPUs      : {gpu_text}")),
             Line::from(format!("Memory    : {}", job.memory)),
             Line::from(format!("Time      : {}", job.time_used)),
             Line::from(""),
             Line::from("c cancel | h hold | u release | r requeue | Esc close"),
-        ];
+        ]);
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: true })
-                .block(panel_block("Job Details".to_string(), true)),
+                .block(self.themed_panel_block("Job Details".to_string(), true)),
             area,
         );
     }
 
-    fn draw_confirmation(frame: &mut Frame<'_>, pending: &PendingAction, area: Rect) {
+    fn draw_confirmation(&self, frame: &mut Frame<'_>, pending: &PendingAction, area: Rect) {
         frame.render_widget(Clear, area);
-        let lines = vec![
+        let irreversible = matches!(pending.action, JobAction::Cancel | JobAction::Requeue);
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "⚠  WARNING",
+                self.theme.warning_border,
+            )),
+            Line::from(""),
             Line::from(format!(
                 "Confirm {} for job {}?",
                 pending.action.label(),
                 pending.job_id
             )),
-            Line::from("y: confirm | n/Esc: cancel"),
         ];
+        if irreversible {
+            lines.push(Line::from(Span::styled(
+                "This action cannot be undone.",
+                self.theme.state_failed,
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from("y: confirm | n/Esc: cancel"));
+        let block = Block::default()
+            .title("⚠ Confirm Job Action")
+            .borders(Borders::ALL)
+            .border_style(self.theme.warning_border);
         frame.render_widget(
-            Paragraph::new(lines).block(panel_block("Confirm Job Action".to_string(), true)),
+            Paragraph::new(lines).block(block),
             area,
         );
     }
@@ -771,6 +1164,13 @@ impl AppState {
             self.handle_input_key(key);
             return false;
         }
+        if self.details_node.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.details_node = None,
+                _ => {}
+            }
+            return false;
+        }
         if self.details_job.is_some() {
             return self.handle_details_key(key);
         }
@@ -788,6 +1188,7 @@ impl AppState {
             KeyCode::Char('2') => self.focus_visible(PanelId::Nodes),
             KeyCode::Char('3') => self.focus_visible(PanelId::Gpus),
             KeyCode::Char('4') => self.focus_visible(PanelId::Summary),
+            KeyCode::Char('5') => self.focus_visible(PanelId::Disks),
             KeyCode::Char('/') => self.begin_input(InputMode::Search),
             KeyCode::Char('f') => self.begin_input(InputMode::Filter),
             KeyCode::Char('s') => self.cycle_sort(),
@@ -799,11 +1200,18 @@ impl AppState {
             KeyCode::Char(']') => self.resize_width(true),
             KeyCode::Char('{') => self.resize_height(false),
             KeyCode::Char('}') => self.resize_height(true),
+            KeyCode::Char('t') => {
+                self.theme_name = self.theme_name.cycle();
+                self.theme = Theme::from_name(self.theme_name);
+                self.status = format!("Theme: {}", self.theme_name.label());
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::Enter => {
                 if self.focus == PanelId::Jobs {
                     self.details_job = self.selected_job().map(|job| job.id);
+                } else if self.focus == PanelId::Nodes {
+                    self.details_node = self.selected_node().map(|node| node.name);
                 }
             }
             _ => {}
@@ -937,22 +1345,6 @@ impl AppState {
         )
     }
 
-    fn visible_accounting(&self) -> Vec<AccountingRecord> {
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            return Vec::new();
-        };
-        let filter = &self.panels[PanelId::Summary.index()].filter;
-        let rows = filter_accounting(&snapshot.snapshot.accounting, filter, &self.current_user)
-            .into_iter()
-            .cloned()
-            .collect();
-        sort_accounting(
-            rows,
-            self.accounting_sort,
-            self.directions[PanelId::Summary.index()],
-        )
-    }
-
     fn gpu_rows(&self) -> Vec<GpuRow> {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return Vec::new();
@@ -1079,6 +1471,7 @@ impl AppState {
             PanelId::Nodes => self.nodes_table.select(Some(row)),
             PanelId::Gpus => self.gpus_table.select(Some(row)),
             PanelId::Summary => self.summary_table.select(Some(row)),
+            PanelId::Disks => self.disks_table.select(Some(row)),
         }
     }
 
@@ -1088,6 +1481,7 @@ impl AppState {
             PanelId::Nodes => &mut self.nodes_table,
             PanelId::Gpus => &mut self.gpus_table,
             PanelId::Summary => &mut self.summary_table,
+            PanelId::Disks => &mut self.disks_table,
         }
     }
 
@@ -1106,6 +1500,7 @@ impl AppState {
             PanelId::Nodes => self.nodes_sort = next_node_column(self.nodes_sort),
             PanelId::Gpus => self.gpu_sort = next_gpu_column(self.gpu_sort),
             PanelId::Summary => self.accounting_sort = next_accounting_column(self.accounting_sort),
+            PanelId::Disks => {} // Sorting not implemented for disks
         }
     }
 
@@ -1116,14 +1511,17 @@ impl AppState {
             PanelId::Nodes => self.nodes_sort = node_column_from_index(actual),
             PanelId::Gpus => self.gpu_sort = gpu_column_from_index(actual),
             PanelId::Summary => self.accounting_sort = accounting_column_from_index(actual),
+            PanelId::Disks => {} // Sorting not implemented for disks
         }
         self.toggle_direction();
     }
 
     fn actual_column(&self, panel: PanelId, visible_column: usize) -> usize {
         let mut seen = 0;
-        for (idx, visible) in self.panels[panel.index()].columns.iter().enumerate() {
-            if *visible {
+        let columns = &self.panels[panel.index()].columns;
+        for idx in 0..50 {
+            let is_visible = *columns.get(idx).unwrap_or(&true);
+            if is_visible {
                 if seen == visible_column {
                     return idx;
                 }
@@ -1140,28 +1538,29 @@ impl AppState {
             .collect()
     }
 
-    fn add_header_hits(&mut self, area: Rect, panel: PanelId, visible_columns: usize) {
-        if visible_columns == 0 || area.width <= 2 || area.height <= 2 {
+    fn add_header_hits(&mut self, area: Rect, panel: PanelId, constraints: &[Constraint]) {
+        if constraints.is_empty() || area.width <= 2 || area.height <= 2 {
             return;
         }
-        let y = area.y + 1;
-        let x = area.x + 1;
-        let width = area.width.saturating_sub(2);
-        let visible_columns = u16::try_from(visible_columns).unwrap_or(u16::MAX).max(1);
-        let col_width = (width / visible_columns).max(1);
-        for idx in 0..visible_columns {
-            let start = x + idx * col_width;
-            let end = if idx + 1 == visible_columns {
-                x + width
-            } else {
-                start + col_width
-            };
+        let table_area = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .spacing(1)
+            .split(table_area);
+        
+        for (idx, col_area) in columns.iter().enumerate() {
             self.header_hits.push(HeaderHit {
                 panel,
-                column: usize::from(idx),
-                x_start: start,
-                x_end: end,
-                y,
+                column: idx,
+                x_start: col_area.x,
+                x_end: col_area.x + col_area.width + 1,
+                y: table_area.y,
             });
         }
     }
@@ -1169,6 +1568,80 @@ impl AppState {
     fn panel_title(&self, panel: PanelId, suffix: impl std::fmt::Display) -> String {
         let marker = if self.focus == panel { "*" } else { " " };
         format!("{marker} {} | {suffix}", panel.title())
+    }
+
+    fn selected_node(&self) -> Option<Node> {
+        let selected = self.nodes_table.selected()?;
+        self.visible_nodes().get(selected).cloned()
+    }
+
+    fn find_node(&self, name: &str) -> Option<Node> {
+        self.snapshot
+            .as_ref()?
+            .snapshot
+            .nodes
+            .iter()
+            .find(|node| node.name == name)
+            .cloned()
+    }
+
+    fn draw_node_details(&self, frame: &mut Frame<'_>, node_name: &str, area: Rect) {
+        let Some(node) = self.find_node(node_name) else {
+            return;
+        };
+        frame.render_widget(Clear, area);
+        let gpu_text = if node.gpus.is_empty() {
+            "0".to_string()
+        } else {
+            node.gpus
+                .iter()
+                .map(|(gpu_type, count)| format!("{gpu_type}:{count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut lines = vec![
+            Line::from(format!("Node      : {}", node.name)),
+            Line::from(format!("State     : {}", node.state)),
+            Line::from(""),
+            Line::from("── CPU ──────────────────────"),
+            Line::from(format!("  Total     : {}", node.cpus.total)),
+            Line::from(format!("  Allocated : {}", node.cpus.allocated)),
+            Line::from(format!("  Idle      : {}", node.cpus.idle)),
+            Line::from(format!("  Other     : {}", node.cpus.other)),
+            Line::from(""),
+            Line::from("── Memory ───────────────────"),
+            Line::from(format!("  Total     : {}", node.memory_total)),
+            Line::from(format!("  Reserved  : {}", node.memory_reserved)),
+            Line::from(format!("  Free      : {}", node.memory_free)),
+            Line::from(""),
+            Line::from("── GPU ──────────────────────"),
+            Line::from(format!("  GPUs      : {gpu_text}")),
+            Line::from(format!("  GRES      : {}", node.gres_raw)),
+        ];
+        if let Some(reason) = &node.reason {
+            lines.push(Line::from(""));
+            lines.push(Line::from(format!("Reason    : {reason}")));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from("Esc: close"));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(self.themed_panel_block("Node Details".to_string(), true)),
+            area,
+        );
+    }
+
+    fn themed_panel_block(&self, title: String, focused: bool) -> Block<'static> {
+        let style = if focused {
+            self.theme.border_focused
+        } else {
+            self.theme.border_unfocused
+        };
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(style)
     }
 }
 
@@ -1216,15 +1689,15 @@ fn gpu_rows_from_summary(summary: &GpuSummary) -> Vec<GpuRow> {
 
 fn compute_panel_areas(
     area: Rect,
-    panels: &[PanelUiState; 4],
+    panels: &[PanelUiState; 5],
     left_percent: u16,
     top_percent: u16,
-) -> [Option<Rect>; 4] {
+) -> [Option<Rect>; 5] {
     let visible: Vec<_> = PanelId::ALL
         .into_iter()
         .filter(|panel| panels[panel.index()].visible)
         .collect();
-    let mut areas = [None, None, None, None];
+    let mut areas = [None, None, None, None, None];
     if visible.is_empty() {
         return areas;
     }
@@ -1254,6 +1727,7 @@ fn compute_panel_areas(
         rows[1],
         &[
             (PanelId::Gpus, panels[PanelId::Gpus.index()].visible),
+            (PanelId::Disks, panels[PanelId::Disks.index()].visible),
             (PanelId::Summary, panels[PanelId::Summary.index()].visible),
         ],
         left_percent,
@@ -1262,7 +1736,7 @@ fn compute_panel_areas(
     let top_empty =
         areas[PanelId::Jobs.index()].is_none() && areas[PanelId::Nodes.index()].is_none();
     let bottom_empty =
-        areas[PanelId::Gpus.index()].is_none() && areas[PanelId::Summary.index()].is_none();
+        areas[PanelId::Gpus.index()].is_none() && areas[PanelId::Summary.index()].is_none() && areas[PanelId::Disks.index()].is_none();
     if top_empty || bottom_empty {
         areas.fill(None);
         place_row(
@@ -1272,6 +1746,7 @@ fn compute_panel_areas(
                 (PanelId::Jobs, panels[PanelId::Jobs.index()].visible),
                 (PanelId::Nodes, panels[PanelId::Nodes.index()].visible),
                 (PanelId::Gpus, panels[PanelId::Gpus.index()].visible),
+                (PanelId::Disks, panels[PanelId::Disks.index()].visible),
                 (PanelId::Summary, panels[PanelId::Summary.index()].visible),
             ],
             left_percent,
@@ -1281,7 +1756,7 @@ fn compute_panel_areas(
 }
 
 fn place_row(
-    areas: &mut [Option<Rect>; 4],
+    areas: &mut [Option<Rect>; 5],
     row: Rect,
     panels: &[(PanelId, bool)],
     left_percent: u16,
@@ -1324,48 +1799,92 @@ fn place_row(
     }
 }
 
-fn panel_block(title: String, focused: bool) -> Block<'static> {
-    let style = if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(style)
-}
-
-fn header_style() -> Style {
-    Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
-}
-
-fn state_style(state: &str) -> Style {
+fn themed_state_style(theme: &Theme, state: &str) -> Style {
     let state = state.to_ascii_uppercase();
     if state.starts_with('R') {
-        Style::default().fg(Color::Green)
+        theme.state_running
     } else if state.starts_with('P') {
-        Style::default().fg(Color::Yellow)
+        theme.state_pending
     } else if state.starts_with('F') || state.starts_with("CANCEL") {
-        Style::default().fg(Color::Red)
+        theme.state_failed
     } else {
         Style::default()
     }
 }
 
-fn node_style(state: &str) -> Style {
+fn themed_node_style(theme: &Theme, state: &str) -> Style {
     let state = state.to_ascii_lowercase();
     if state.contains("idle") {
-        Style::default().fg(Color::Green)
+        theme.node_idle
     } else if state.contains("down") || state.contains("drain") {
-        Style::default().fg(Color::Red)
+        theme.node_down
     } else {
-        Style::default().fg(Color::Yellow)
+        theme.node_mixed
+    }
+}
+
+fn sort_indicator(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::Asc => " ▲",
+        SortDirection::Desc => " ▼",
+    }
+}
+
+fn decorate_headers<const N: usize>(
+    headers: &[&str; N],
+    sort_column: usize,
+    direction: SortDirection,
+    visible: &[bool],
+) -> Vec<Cell<'static>> {
+    headers
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *visible.get(*idx).unwrap_or(&true))
+        .map(|(idx, header)| {
+            if idx == sort_column {
+                Cell::from(format!("{header}{}", sort_indicator(direction)))
+            } else {
+                Cell::from(header.to_string())
+            }
+        })
+        .collect()
+}
+
+fn job_column_to_index(col: JobColumn) -> usize {
+    match col {
+        JobColumn::JobId => 0,
+        JobColumn::User => 1,
+        JobColumn::State => 2,
+        JobColumn::Partition => 3,
+        JobColumn::Name => 4,
+        JobColumn::Nodes => 5,
+        JobColumn::Cpus => 6,
+        JobColumn::Gpus => 7,
+        JobColumn::Memory => 8,
+        JobColumn::Time => 9,
+    }
+}
+
+fn node_column_to_index(col: NodeColumn) -> usize {
+    match col {
+        NodeColumn::Name => 0,
+        NodeColumn::State => 1,
+        NodeColumn::CpusTotal => 2,
+        NodeColumn::CpusFree => 3,
+        NodeColumn::MemoryTotal => 4,
+        NodeColumn::MemoryFree => 5,
+        NodeColumn::GpusTotal => 6,
+        NodeColumn::GpusFree => 7,
+    }
+}
+
+fn gpu_column_to_index(col: GpuColumn) -> usize {
+    match col {
+        GpuColumn::Type => 0,
+        GpuColumn::Total => 1,
+        GpuColumn::Active => 2,
+        GpuColumn::Reserved => 3,
+        GpuColumn::Free => 4,
     }
 }
 
@@ -1464,13 +1983,12 @@ fn next_node_column(column: NodeColumn) -> NodeColumn {
     match column {
         NodeColumn::State => NodeColumn::Name,
         NodeColumn::Name => NodeColumn::CpusTotal,
-        NodeColumn::CpusTotal => NodeColumn::CpusAllocated,
-        NodeColumn::CpusAllocated => NodeColumn::CpusIdle,
-        NodeColumn::CpusIdle => NodeColumn::MemoryTotal,
-        NodeColumn::MemoryTotal => NodeColumn::MemoryReserved,
-        NodeColumn::MemoryReserved => NodeColumn::MemoryFree,
-        NodeColumn::MemoryFree => NodeColumn::Gpus,
-        NodeColumn::Gpus => NodeColumn::State,
+        NodeColumn::CpusTotal => NodeColumn::CpusFree,
+        NodeColumn::CpusFree => NodeColumn::MemoryTotal,
+        NodeColumn::MemoryTotal => NodeColumn::MemoryFree,
+        NodeColumn::MemoryFree => NodeColumn::GpusTotal,
+        NodeColumn::GpusTotal => NodeColumn::GpusFree,
+        NodeColumn::GpusFree => NodeColumn::State,
     }
 }
 
@@ -1520,12 +2038,11 @@ fn node_column_from_index(idx: usize) -> NodeColumn {
         NodeColumn::Name,
         NodeColumn::State,
         NodeColumn::CpusTotal,
-        NodeColumn::CpusAllocated,
-        NodeColumn::CpusIdle,
+        NodeColumn::CpusFree,
         NodeColumn::MemoryTotal,
-        NodeColumn::MemoryReserved,
         NodeColumn::MemoryFree,
-        NodeColumn::Gpus,
+        NodeColumn::GpusTotal,
+        NodeColumn::GpusFree,
     ]
     .get(idx)
     .copied()

@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use regex::Regex;
-use slmtop_core::{AccountingRecord, CpuCounts, GpuMap, Job, MemoryMb, Node};
+use slmtop_core::{AccountingRecord, CpuCounts, DiskInfo, DiskLabel, GpuMap, Job, MemoryMb, Node};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parsed<T> {
@@ -28,7 +28,7 @@ pub fn parse_squeue(output: &str) -> Parsed<Job> {
             continue;
         }
         let parts: Vec<_> = line.split('|').map(str::trim).collect();
-        if parts.len() < 10 {
+        if parts.len() < 11 {
             warnings.push(format!(
                 "squeue line {} has {} fields: {line}",
                 idx + 1,
@@ -48,8 +48,9 @@ pub fn parse_squeue(output: &str) -> Parsed<Job> {
             gpus: parse_gpu_map(parts[8]),
             gres_raw: parts[8].to_string(),
             time_used: parts[9].to_string(),
+            node_list: parts[10].to_string(),
             reason: parts
-                .get(10)
+                .get(11)
                 .filter(|value| !value.is_empty())
                 .map(|value| (*value).to_string()),
         });
@@ -90,6 +91,7 @@ pub fn parse_sinfo(output: &str) -> Parsed<Node> {
             memory_reserved: reserved,
             memory_free: free,
             gpus: parse_gpu_map(parts[6]),
+            gpus_allocated: parts.get(8).map_or_else(GpuMap::default, |s| parse_gpu_map(s)),
             gres_raw: parts[6].to_string(),
             reason: parts
                 .get(7)
@@ -260,6 +262,79 @@ fn looks_like_header(line: &str, marker: &str) -> bool {
 }
 
 #[must_use]
+pub fn parse_df(output: &str) -> Vec<DiskInfo> {
+    let mut disks = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with("Filesystem")
+            || line.starts_with("filesystem")
+        {
+            continue;
+        }
+        let parts: Vec<_> = line.split_whitespace().collect();
+        // Expected: source fstype size used avail pcent target
+        if parts.len() < 7 {
+            continue;
+        }
+        let percent_str = parts[5].trim_end_matches('%');
+        let use_percent = percent_str.parse::<u8>().unwrap_or(0);
+        let fstype = parts[1].to_lowercase();
+        let source = parts[0].to_lowercase();
+        let label = classify_disk(&source, &fstype);
+        // Skip pseudo filesystems
+        if matches!(
+            fstype.as_str(),
+            "tmpfs" | "devtmpfs" | "sysfs" | "proc" | "devpts" | "cgroup" | "cgroup2"
+                | "securityfs" | "pstore" | "efivarfs" | "bpf" | "autofs"
+                | "hugetlbfs" | "mqueue" | "debugfs" | "tracefs" | "fusectl"
+                | "configfs" | "ramfs" | "rpc_pipefs" | "nsfs" | "overlay"
+        ) {
+            continue;
+        }
+        disks.push(DiskInfo {
+            mount: parts[6..].join(" "),
+            fstype: parts[1].to_string(),
+            size: parts[2].to_string(),
+            used: parts[3].to_string(),
+            avail: parts[4].to_string(),
+            use_percent,
+            label,
+        });
+    }
+    disks
+}
+
+fn classify_disk(source: &str, fstype: &str) -> DiskLabel {
+    match fstype {
+        "nfs" | "nfs4" | "nfs3" | "cifs" | "smb" | "smbfs" => DiskLabel::Nfs,
+        "lustre" | "gpfs" | "beegfs" | "orangefs" | "pvfs2" | "cephfs" | "glusterfs" => {
+            DiskLabel::ParallelFs
+        }
+        _ => {
+            if source.contains("nvme") {
+                DiskLabel::Ssd
+            } else if source.starts_with("/dev/sd") {
+                // Try to detect via sysfs — fall back to HDD for spinning disks
+                let dev = source
+                    .trim_start_matches("/dev/")
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .collect::<String>();
+                let rotational_path = format!("/sys/block/{dev}/queue/rotational");
+                match std::fs::read_to_string(&rotational_path) {
+                    Ok(val) if val.trim() == "0" => DiskLabel::Ssd,
+                    Ok(_) => DiskLabel::Hdd,
+                    Err(_) => DiskLabel::Unknown,
+                }
+            } else {
+                DiskLabel::Unknown
+            }
+        }
+    }
+}
+
+#[must_use]
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
@@ -288,12 +363,13 @@ mod tests {
 
     #[test]
     fn parses_squeue_rows() {
-        let output = "123|alice|RUNNING|gpu|train|1|8|32G|gpu:a100:2|01:02:03|None\n";
+        let output = "123|alice|RUNNING|gpu|train|1|8|32G|gpu:a100:2|01:02:03|node001|None\n";
         let parsed = parse_squeue(output);
         assert!(parsed.warnings.is_empty());
         assert_eq!(parsed.rows.len(), 1);
         assert_eq!(parsed.rows[0].gpu_total(), 2);
         assert_eq!(parsed.rows[0].memory.0, 32 * 1024);
+        assert_eq!(parsed.rows[0].node_list, "node001");
     }
 
     #[test]

@@ -83,6 +83,7 @@ pub struct Job {
     pub partition: String,
     pub name: String,
     pub nodes: String,
+    pub node_list: String,
     pub cpus: u64,
     pub memory: MemoryMb,
     pub gpus: GpuMap,
@@ -110,13 +111,14 @@ impl Job {
     #[must_use]
     pub fn searchable_text(&self) -> String {
         format!(
-            "{} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {}",
             self.id,
             self.user,
             self.state,
             self.partition,
             self.name,
             self.nodes,
+            self.node_list,
             self.gres_raw,
             self.reason.as_deref().unwrap_or_default()
         )
@@ -133,6 +135,7 @@ pub struct Node {
     pub memory_reserved: MemoryMb,
     pub memory_free: MemoryMb,
     pub gpus: GpuMap,
+    pub gpus_allocated: GpuMap,
     pub gres_raw: String,
     pub reason: Option<String>,
 }
@@ -141,6 +144,11 @@ impl Node {
     #[must_use]
     pub fn gpu_total(&self) -> u64 {
         self.gpus.values().sum()
+    }
+
+    #[must_use]
+    pub fn gpu_allocated(&self) -> u64 {
+        self.gpus_allocated.values().sum()
     }
 
     #[must_use]
@@ -219,12 +227,52 @@ pub struct GpuSummary {
     pub by_type: BTreeMap<String, GpuTypeSummary>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskInfo {
+    pub mount: String,
+    pub fstype: String,
+    pub size: String,
+    pub used: String,
+    pub avail: String,
+    pub use_percent: u8,
+    pub label: DiskLabel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiskLabel {
+    Ssd,
+    Hdd,
+    Nfs,
+    ParallelFs,
+    Unknown,
+}
+
+impl DiskLabel {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ssd => "SSD",
+            Self::Hdd => "HDD",
+            Self::Nfs => "NFS",
+            Self::ParallelFs => "PFS",
+            Self::Unknown => "---",
+        }
+    }
+}
+
+impl fmt::Display for DiskLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterSnapshot {
     pub captured_at: SystemTime,
     pub jobs: Vec<Job>,
     pub nodes: Vec<Node>,
     pub accounting: Vec<AccountingRecord>,
+    pub disk_info: Vec<DiskInfo>,
     pub job_summary: JobSummary,
     pub gpu_summary: GpuSummary,
     pub warnings: Vec<String>,
@@ -236,6 +284,7 @@ impl ClusterSnapshot {
         jobs: Vec<Job>,
         nodes: Vec<Node>,
         accounting: Vec<AccountingRecord>,
+        disk_info: Vec<DiskInfo>,
         current_user: &str,
         warnings: Vec<String>,
     ) -> Self {
@@ -246,6 +295,7 @@ impl ClusterSnapshot {
             jobs,
             nodes,
             accounting,
+            disk_info,
             job_summary,
             gpu_summary,
             warnings,
@@ -259,11 +309,12 @@ pub enum PanelId {
     Jobs,
     Nodes,
     Gpus,
+    Disks,
     Summary,
 }
 
 impl PanelId {
-    pub const ALL: [Self; 4] = [Self::Jobs, Self::Nodes, Self::Gpus, Self::Summary];
+    pub const ALL: [Self; 5] = [Self::Jobs, Self::Nodes, Self::Gpus, Self::Disks, Self::Summary];
 
     #[must_use]
     pub const fn title(self) -> &'static str {
@@ -271,6 +322,7 @@ impl PanelId {
             Self::Jobs => "Jobs",
             Self::Nodes => "Nodes",
             Self::Gpus => "GPUs / Resources",
+            Self::Disks => "Disks",
             Self::Summary => "Summary / Accounting",
         }
     }
@@ -281,7 +333,8 @@ impl PanelId {
             Self::Jobs => 0,
             Self::Nodes => 1,
             Self::Gpus => 2,
-            Self::Summary => 3,
+            Self::Disks => 3,
+            Self::Summary => 4,
         }
     }
 }
@@ -307,12 +360,11 @@ pub enum NodeColumn {
     State,
     Name,
     CpusTotal,
-    CpusAllocated,
-    CpusIdle,
+    CpusFree,
     MemoryTotal,
-    MemoryReserved,
     MemoryFree,
-    Gpus,
+    GpusTotal,
+    GpusFree,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -396,6 +448,28 @@ pub fn state_rank(state: &str) -> u8 {
     }
 }
 
+pub fn parse_slurm_time(time_str: &str) -> u64 {
+    let mut days = 0;
+    let mut rest = time_str;
+    if let Some((d_str, t_str)) = time_str.split_once('-') {
+        days = d_str.parse::<u64>().unwrap_or(0);
+        rest = t_str;
+    }
+    let parts: Vec<&str> = rest.split(':').collect();
+    let mut total_seconds = days * 86400;
+    if parts.len() == 3 {
+        let h = parts[0].parse::<u64>().unwrap_or(0);
+        let m = parts[1].parse::<u64>().unwrap_or(0);
+        let s = parts[2].parse::<u64>().unwrap_or(0);
+        total_seconds += h * 3600 + m * 60 + s;
+    } else if parts.len() == 2 {
+        let m = parts[0].parse::<u64>().unwrap_or(0);
+        let s = parts[1].parse::<u64>().unwrap_or(0);
+        total_seconds += m * 60 + s;
+    }
+    total_seconds
+}
+
 #[must_use]
 pub fn sort_jobs(mut jobs: Vec<Job>, column: JobColumn, direction: SortDirection) -> Vec<Job> {
     jobs.sort_by(|a, b| {
@@ -411,7 +485,7 @@ pub fn sort_jobs(mut jobs: Vec<Job>, column: JobColumn, direction: SortDirection
             JobColumn::Cpus => a.cpus.cmp(&b.cpus),
             JobColumn::Gpus => a.gpu_total().cmp(&b.gpu_total()),
             JobColumn::Memory => a.memory.cmp(&b.memory),
-            JobColumn::Time => a.time_used.cmp(&b.time_used),
+            JobColumn::Time => parse_slurm_time(&a.time_used).cmp(&parse_slurm_time(&b.time_used)),
         };
         match direction {
             SortDirection::Asc => ordering,
@@ -428,12 +502,11 @@ pub fn sort_nodes(mut nodes: Vec<Node>, column: NodeColumn, direction: SortDirec
             NodeColumn::State => a.state.to_lowercase().cmp(&b.state.to_lowercase()),
             NodeColumn::Name => a.name.cmp(&b.name),
             NodeColumn::CpusTotal => a.cpus.total.cmp(&b.cpus.total),
-            NodeColumn::CpusAllocated => a.cpus.allocated.cmp(&b.cpus.allocated),
-            NodeColumn::CpusIdle => a.cpus.idle.cmp(&b.cpus.idle),
+            NodeColumn::CpusFree => a.cpus.idle.cmp(&b.cpus.idle),
             NodeColumn::MemoryTotal => a.memory_total.cmp(&b.memory_total),
-            NodeColumn::MemoryReserved => a.memory_reserved.cmp(&b.memory_reserved),
             NodeColumn::MemoryFree => a.memory_free.cmp(&b.memory_free),
-            NodeColumn::Gpus => a.gpu_total().cmp(&b.gpu_total()),
+            NodeColumn::GpusTotal => a.gpu_total().cmp(&b.gpu_total()),
+            NodeColumn::GpusFree => (a.gpu_total().saturating_sub(a.gpu_allocated())).cmp(&(b.gpu_total().saturating_sub(b.gpu_allocated()))),
         };
         match direction {
             SortDirection::Asc => ordering,
@@ -633,30 +706,19 @@ pub fn summarize_gpus(nodes: &[Node], jobs: &[Job]) -> GpuSummary {
             bucket.total += count;
             summary.total += count;
         }
+        for (gpu_type, count) in &node.gpus_allocated {
+            let bucket = summary.by_type.entry(gpu_type.clone()).or_default();
+            bucket.active += count;
+            summary.active += count;
+        }
     }
     for job in jobs {
         let state = job.state.to_ascii_uppercase();
-        let target = if state.starts_with('R') {
-            Some("active")
-        } else if state.starts_with('P') {
-            Some("reserved")
-        } else {
-            None
-        };
-        let Some(target) = target else {
-            continue;
-        };
-        let job_total = job.gpu_total();
-        if target == "active" {
-            summary.active += job_total;
-        } else {
+        if state.starts_with('P') {
+            let job_total = job.gpu_total();
             summary.reserved += job_total;
-        }
-        for (gpu_type, count) in &job.gpus {
-            let bucket = summary.by_type.entry(gpu_type.clone()).or_default();
-            if target == "active" {
-                bucket.active += count;
-            } else {
+            for (gpu_type, count) in &job.gpus {
+                let bucket = summary.by_type.entry(gpu_type.clone()).or_default();
                 bucket.reserved += count;
             }
         }
