@@ -1,6 +1,6 @@
 # slmtop
 
-`slmtop` is a Rust terminal dashboard for realtime Slurm monitoring. It is inspired by `htop` and `slurm-monitor-top`, and built for Slurm-specific jobs, nodes, GPU resources, disks and recent accounting data.
+`slmtop` is a terminal dashboard developed with Rust for realtime Slurm monitoring. It is inspired by `htop` and `slurm-monitor-top`, and built for Slurm-specific jobs, nodes, GPU resources, disks and recent accounting data.
 <img width="1728" height="1048" alt="image" src="https://github.com/user-attachments/assets/10f1cda4-637f-4ab7-a247-8cef99cc7ad9" />
 
 
