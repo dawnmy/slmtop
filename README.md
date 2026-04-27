@@ -6,14 +6,13 @@
 
 ## Features
 
-- Four focusable TUI panels: jobs, nodes, GPUs/resources, disks and summary/accounting.
+- Five focusable TUI panels: jobs, nodes, GPUs/resources, disks and summary/accounting.
 - Realtime refresh from Slurm CLI commands with per-command timeouts and structured errors.
 - Sortable tables by keyboard or mouse header click.
 - Search and typed filters per panel, for example `owner=me state=running gpu=a100`.
 - Panel focus, resize, show/hide, row selection, and column visibility controls.
 - Job details with guarded `cancel`, `hold`, `release`, and `requeue` actions.
-- Typed parsers and resource aggregation for memory, CPUs, GPUs, GRES, and `sacct` rows.
-- Backend trait layout ready for a future `slurmrestd` implementation.
+- Per-user resource usage stats: Jobs, CPUs, GPUs, memory and job time limit.
 
 ## Requirements
 
