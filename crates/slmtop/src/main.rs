@@ -26,6 +26,7 @@ struct Args {
     command_timeout: f64,
 
     #[arg(
+        short = 'd',
         long,
         default_value_t = 180.0,
         help = "Disk usage scan timeout in seconds; use --disk-usage-no-timeout to keep usage scans running in the background until complete"
@@ -33,6 +34,7 @@ struct Args {
     disk_usage_timeout: f64,
 
     #[arg(
+        short = 'n',
         long,
         help = "Disable timeout for disk usage scans; scans keep running in the background and results are cached when they finish"
     )]
@@ -54,12 +56,6 @@ struct Args {
     user: Option<String>,
 
     #[arg(
-        long,
-        help = "Print version and exit without starting the TUI"
-    )]
-    version_only: bool,
-
-    #[arg(
         short = 'T',
         long,
         default_value = "catppuccin",
@@ -77,11 +73,6 @@ async fn main() -> Result<()> {
         .ok();
 
     let args = Args::parse();
-    if args.version_only {
-        println!("slmtop {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-
     let mut config = BackendConfig {
         refresh_interval: duration_from_secs(args.refresh_interval),
         command_timeout: duration_from_secs(args.command_timeout),

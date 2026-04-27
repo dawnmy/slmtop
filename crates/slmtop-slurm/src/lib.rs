@@ -1,5 +1,6 @@
 //! Backend traits for collecting and controlling Slurm state.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -29,6 +30,25 @@ pub enum SlurmError {
 }
 
 pub type Result<T> = std::result::Result<T, SlurmError>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskUsageProgress {
+    pub stage: DiskUsageProgressStage,
+    pub scanned_entries: u64,
+    pub matched_entries: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiskUsageProgressStage {
+    #[default]
+    Starting,
+    Quota,
+    UserDirectory,
+    Traversal,
+}
+
+pub type DiskUsageProgressCallback = Arc<dyn Fn(DiskUsageProgress) + Send + Sync + 'static>;
 
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
@@ -91,6 +111,7 @@ pub trait SlurmBackend: Send + Sync {
         _mount: &str,
         _user: &str,
         _timeout: Option<Duration>,
+        _progress: Option<DiskUsageProgressCallback>,
     ) -> Result<Vec<DiskUserUsage>> {
         Ok(Vec::new())
     }

@@ -1,6 +1,7 @@
 //! Slurm CLI backend implementation.
 
-use std::path::Path;
+use std::env;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,10 @@ use slmtop_parsers::{
     parse_df, parse_du_user_usage, parse_lfs_quota_user_usage, parse_sacct, parse_sinfo,
     parse_squeue,
 };
-use slmtop_slurm::{CommandTelemetry, JobControl, Result, SlurmBackend, SlurmError};
+use slmtop_slurm::{
+    CommandTelemetry, DiskUsageProgress, DiskUsageProgressCallback, DiskUsageProgressStage,
+    JobControl, Result, SlurmBackend, SlurmError,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -187,7 +191,9 @@ impl SlurmBackend for CliSlurmBackend {
         mount: &str,
         user: &str,
         scan_timeout: Option<Duration>,
+        progress: Option<DiskUsageProgressCallback>,
     ) -> Result<Vec<DiskUserUsage>> {
+        emit_disk_usage_stage(progress.as_ref(), DiskUsageProgressStage::Quota);
         if let Ok(output) = self
             .run_with_timeout(
                 "lfs",
@@ -198,12 +204,13 @@ impl SlurmBackend for CliSlurmBackend {
             .await
         {
             let rows = parse_lfs_quota_user_usage(&output.stdout, user);
-            if !rows.is_empty() {
+            if has_informative_usage(&rows) {
                 return Ok(rows);
             }
         }
 
         for path in user_disk_paths(mount, user) {
+            emit_disk_usage_stage(progress.as_ref(), DiskUsageProgressStage::UserDirectory);
             let output = match self
                 .run_with_optional_timeout("du", &["-sxB1", &path], true, scan_timeout)
                 .await
@@ -213,12 +220,13 @@ impl SlurmBackend for CliSlurmBackend {
                 Err(_) => continue,
             };
             let rows = parse_du_user_usage(&output.stdout, user);
-            if !rows.is_empty() {
+            if has_informative_usage(&rows) {
                 return Ok(rows);
             }
         }
 
-        stream_find_current_user_usage(mount, user, scan_timeout)
+        emit_disk_usage_stage(progress.as_ref(), DiskUsageProgressStage::Traversal);
+        stream_find_current_user_usage(mount, user, scan_timeout, progress)
             .await
             .map_err(disk_scan_error)
     }
@@ -261,15 +269,36 @@ fn user_disk_paths(mount: &str, user: &str) -> Vec<String> {
         return Vec::new();
     }
     let mount = Path::new(mount);
-    [
+    let mut paths = [
         mount.join(user),
         mount.join("users").join(user),
         mount.join("home").join(user),
     ]
     .into_iter()
-    .filter(|path| path.is_dir())
-    .filter_map(|path| path.into_os_string().into_string().ok())
-    .collect()
+    .collect::<Vec<_>>();
+
+    if let Some(home) = current_user_home_on_mount(mount, user) {
+        paths.insert(0, home);
+    }
+
+    let mut paths = paths
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .filter_map(|path| path.into_os_string().into_string().ok())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn current_user_home_on_mount(mount: &Path, user: &str) -> Option<PathBuf> {
+    let home = PathBuf::from(env::var_os("HOME")?);
+    if !home.is_dir() || !home.starts_with(mount) {
+        return None;
+    }
+    home.file_name()
+        .is_some_and(|name| name == user)
+        .then_some(home)
 }
 
 fn disk_scan_timeout(timeout: Duration) -> SlurmError {
@@ -279,16 +308,23 @@ fn disk_scan_timeout(timeout: Duration) -> SlurmError {
     ))
 }
 
+fn has_informative_usage(rows: &[DiskUserUsage]) -> bool {
+    rows.iter().any(|row| row.bytes > 0 || row.entries > 0)
+}
+
 async fn stream_find_current_user_usage(
     mount: &str,
     user: &str,
     scan_timeout: Option<Duration>,
+    progress: Option<DiskUsageProgressCallback>,
 ) -> Result<Vec<DiskUserUsage>> {
     let scan = async {
         let command = "disk usage scan".to_string();
         let mut child = Command::new("find");
         child
-            .args([mount, "-xdev", "-user", user, "-printf", "%b\n"])
+            .args([
+                mount, "-xdev", "-printf", "s\n", "-user", user, "-printf", "u%b\n",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -306,20 +342,60 @@ async fn stream_find_current_user_usage(
             bytes: 0,
             entries: 0,
         };
+        let mut scanned_entries = 0_u64;
+        let mut last_progress_scanned_entries = 0;
+        let mut last_progress_matched_entries = 0;
+        let mut last_progress_at = Instant::now();
         while let Some(line) = lines.next_line().await.map_err(|source| SlurmError::Io {
             command: command.clone(),
             source,
         })? {
-            let Ok(blocks) = line.trim().parse::<u64>() else {
+            let line = line.trim();
+            if line == "s" {
+                scanned_entries = scanned_entries.saturating_add(1);
+                if should_emit_disk_usage_progress(
+                    scanned_entries,
+                    last_progress_scanned_entries,
+                    last_progress_at,
+                ) {
+                    emit_disk_usage_progress(progress.as_ref(), scanned_entries, &row);
+                    last_progress_scanned_entries = scanned_entries;
+                    last_progress_matched_entries = row.entries;
+                    last_progress_at = Instant::now();
+                }
+                continue;
+            }
+            let Some(blocks) = line
+                .strip_prefix('u')
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
                 continue;
             };
             row.bytes = row.bytes.saturating_add(blocks.saturating_mul(512));
             row.entries = row.entries.saturating_add(1);
+            if row.entries == 1
+                || row.entries.saturating_sub(last_progress_matched_entries) >= 256
+                || should_emit_disk_usage_progress(
+                    scanned_entries,
+                    last_progress_scanned_entries,
+                    last_progress_at,
+                )
+            {
+                emit_disk_usage_progress(progress.as_ref(), scanned_entries, &row);
+                last_progress_scanned_entries = scanned_entries;
+                last_progress_matched_entries = row.entries;
+                last_progress_at = Instant::now();
+            }
         }
         let _status = child
             .wait()
             .await
             .map_err(|source| SlurmError::Io { command, source })?;
+        if scanned_entries > last_progress_scanned_entries
+            || row.entries > last_progress_matched_entries
+        {
+            emit_disk_usage_progress(progress.as_ref(), scanned_entries, &row);
+        }
         if row.entries == 0 {
             Ok(Vec::new())
         } else {
@@ -333,6 +409,43 @@ async fn stream_find_current_user_usage(
             .map_err(|_| disk_scan_timeout(scan_timeout))?
     } else {
         scan.await
+    }
+}
+
+fn should_emit_disk_usage_progress(
+    scanned_entries: u64,
+    last_progress_scanned_entries: u64,
+    last_progress_at: Instant,
+) -> bool {
+    scanned_entries == 1
+        || scanned_entries.saturating_sub(last_progress_scanned_entries) >= 1_024
+        || last_progress_at.elapsed() >= Duration::from_millis(500)
+}
+
+fn emit_disk_usage_progress(
+    progress: Option<&DiskUsageProgressCallback>,
+    scanned_entries: u64,
+    row: &DiskUserUsage,
+) {
+    if let Some(progress) = progress {
+        progress(DiskUsageProgress {
+            stage: DiskUsageProgressStage::Traversal,
+            scanned_entries,
+            matched_entries: row.entries,
+            bytes: row.bytes,
+        });
+    }
+}
+
+fn emit_disk_usage_stage(
+    progress: Option<&DiskUsageProgressCallback>,
+    stage: DiskUsageProgressStage,
+) {
+    if let Some(progress) = progress {
+        progress(DiskUsageProgress {
+            stage,
+            ..DiskUsageProgress::default()
+        });
     }
 }
 
@@ -354,4 +467,33 @@ fn disk_scan_error(error: SlurmError) -> SlurmError {
 #[must_use]
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_byte_rows_without_entry_counts_are_inconclusive() {
+        let rows = vec![DiskUserUsage {
+            user: "alice".to_string(),
+            bytes: 0,
+            entries: 0,
+        }];
+        assert!(!has_informative_usage(&rows));
+    }
+
+    #[test]
+    fn rows_with_bytes_or_entries_are_informative() {
+        assert!(has_informative_usage(&[DiskUserUsage {
+            user: "alice".to_string(),
+            bytes: 512,
+            entries: 0,
+        }]));
+        assert!(has_informative_usage(&[DiskUserUsage {
+            user: "alice".to_string(),
+            bytes: 0,
+            entries: 1,
+        }]));
+    }
 }

@@ -406,20 +406,33 @@ pub fn parse_lfs_quota_user_usage(output: &str, user: &str) -> Vec<DiskUserUsage
             continue;
         }
         let tokens = line.split_whitespace().collect::<Vec<_>>();
-        let used_token = if tokens.first().is_some_and(|token| token.starts_with('/')) {
-            tokens.get(1).copied()
-        } else {
-            tokens.first().copied()
-        };
+        let offset = usize::from(tokens.first().is_some_and(|token| token.starts_with('/')));
+        let used_token = tokens.get(offset).copied();
+        let entries = tokens
+            .get(offset + 4)
+            .and_then(|token| parse_quota_count(token))
+            .unwrap_or(0);
         if let Some(bytes) = used_token.and_then(quota_size_to_bytes) {
             return vec![DiskUserUsage {
                 user: user.to_string(),
                 bytes,
-                entries: 0,
+                entries,
             }];
         }
     }
     Vec::new()
+}
+
+fn parse_quota_count(value: &str) -> Option<u64> {
+    let digits = value
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 fn quota_size_to_bytes(value: &str) -> Option<u64> {
@@ -453,24 +466,16 @@ fn quota_size_to_bytes(value: &str) -> Option<u64> {
 }
 
 fn decimal_parts_u64(number: &str) -> (u64, u64, u64) {
-    let Some((whole, fraction)) = number.split_once('.') else {
-        return (number.parse().unwrap_or(0), 0, 1);
-    };
-    let fraction_digits = fraction
-        .chars()
-        .filter(char::is_ascii_digit)
-        .collect::<String>();
-    if fraction_digits.is_empty() {
-        return (whole.parse().unwrap_or(0), 0, 1);
-    }
-    let scale = 10_u64.saturating_pow(u32::try_from(fraction_digits.len()).unwrap_or(0));
-    (
-        whole.parse().unwrap_or(0),
-        fraction_digits.parse().unwrap_or(0),
-        scale,
-    )
+    let mut parts = number.splitn(2, '.');
+    let whole = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let fraction_text = parts.next().unwrap_or("");
+    let fraction = fraction_text.parse::<u64>().unwrap_or(0);
+    let scale = 10_u64.saturating_pow(u32::try_from(fraction_text.len()).unwrap_or(0));
+    (whole, fraction, scale.max(1))
 }
-
 fn classify_disk(source: &str, fstype: &str) -> DiskLabel {
     match fstype {
         "nfs" | "nfs4" | "nfs3" | "cifs" | "smb" | "smbfs" => DiskLabel::Nfs,
@@ -598,6 +603,6 @@ Disk quotas for usr alice (uid 1000):
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].user, "alice");
         assert_eq!(rows[0].bytes, 1_610_612_736);
-        assert_eq!(rows[0].entries, 0);
+        assert_eq!(rows[0].entries, 10);
     }
 }

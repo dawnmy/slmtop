@@ -6,11 +6,11 @@ use std::fs;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -24,13 +24,18 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Table
 use ratatui::{Frame, Terminal};
 use serde::{Deserialize, Serialize};
 use slmtop_core::{
-    filter_jobs, filter_nodes, parse_slurm_time, sort_jobs, sort_nodes, AccountingColumn,
-    ClusterSnapshot, DiskInfo, DiskUserUsage, FilterExpression, GpuSummary, Job, JobColumn, Node,
-    NodeColumn, OwnerSummary, PanelId, SortDirection,
+    filter_jobs, filter_nodes, human_bytes, parse_slurm_time, sort_jobs, sort_nodes,
+    AccountingColumn, ClusterSnapshot, DiskInfo, DiskUserUsage, FilterExpression, GpuSummary, Job,
+    JobColumn, Node, NodeColumn, OwnerSummary, PanelId, SortDirection,
 };
-use slmtop_slurm::{refresh_backend, BackendConfig, SlurmClient, SlurmError, SnapshotEnvelope};
+use slmtop_slurm::{
+    refresh_backend, BackendConfig, DiskUsageProgress, DiskUsageProgressCallback,
+    DiskUsageProgressStage, SlurmClient, SlurmError, SnapshotEnvelope,
+};
 use thiserror::Error;
+use time::{OffsetDateTime, UtcOffset};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 type TerminalBackend = CrosstermBackend<Stdout>;
@@ -533,24 +538,38 @@ fn spawn_disk_usage<B>(
     backend: Arc<B>,
     mount: String,
     user: String,
+    scan_id: u64,
     scan_timeout: Option<Duration>,
     tx: mpsc::Sender<UiMessage>,
-) where
+) -> JoinHandle<()>
+where
     B: SlurmClient + 'static,
 {
     tokio::spawn(async move {
+        let progress_tx = tx.clone();
+        let progress_mount = mount.clone();
+        let progress_user = user.clone();
+        let progress: DiskUsageProgressCallback = Arc::new(move |progress: DiskUsageProgress| {
+            let _ = progress_tx.try_send(UiMessage::DiskUsageProgress {
+                mount: progress_mount.clone(),
+                user: progress_user.clone(),
+                scan_id,
+                progress,
+            });
+        });
         let result = backend
-            .disk_user_usage(&mount, &user, scan_timeout)
+            .disk_user_usage(&mount, &user, scan_timeout, Some(progress))
             .await
             .map_err(|error| friendly_disk_usage_error(&error.to_string()));
         let _ = tx
             .send(UiMessage::DiskUsage {
                 mount,
                 user,
+                scan_id,
                 result,
             })
             .await;
-    });
+    })
 }
 
 #[derive(Debug)]
@@ -561,7 +580,14 @@ enum UiMessage {
     DiskUsage {
         mount: String,
         user: String,
+        scan_id: u64,
         result: std::result::Result<Vec<DiskUserUsage>, String>,
+    },
+    DiskUsageProgress {
+        mount: String,
+        user: String,
+        scan_id: u64,
+        progress: DiskUsageProgress,
     },
 }
 
@@ -687,9 +713,12 @@ struct DiskUsageCacheFileEntry {
     value: DiskUsageCacheEntry,
 }
 
-#[derive(Debug, Clone, Copy)]
 struct DiskUsageScan {
+    id: u64,
     started_at: Instant,
+    timeout: Option<Duration>,
+    progress: Option<DiskUsageProgress>,
+    handle: JoinHandle<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -703,6 +732,8 @@ struct DiskUsageView {
     rows: Vec<DiskUserUsage>,
     captured_at: Option<SystemTime>,
     scan_started_at: Option<Instant>,
+    scan_timeout: Option<Duration>,
+    progress: Option<DiskUsageProgress>,
     error: Option<DiskUsageError>,
 }
 
@@ -799,6 +830,7 @@ struct AppState {
     disk_usage_cache: HashMap<DiskUsageKey, DiskUsageCacheEntry>,
     disk_usage_scans: HashMap<DiskUsageKey, DiskUsageScan>,
     disk_usage_errors: HashMap<DiskUsageKey, DiskUsageError>,
+    next_disk_usage_scan_id: u64,
     panel_areas: [Option<Rect>; 5],
     header_hits: Vec<HeaderHit>,
     modal_header_hits: Vec<ModalHeaderHit>,
@@ -883,6 +915,7 @@ impl AppState {
             disk_usage_cache: load_disk_usage_cache(),
             disk_usage_scans: HashMap::new(),
             disk_usage_errors: HashMap::new(),
+            next_disk_usage_scan_id: 1,
             panel_areas: [None, None, None, None, None],
             header_hits: Vec::new(),
             modal_header_hits: Vec::new(),
@@ -920,52 +953,74 @@ impl AppState {
             UiMessage::DiskUsage {
                 mount,
                 user,
+                scan_id,
                 result,
-            } => match result {
-                Ok(rows) => {
-                    let key = DiskUsageKey {
-                        mount: mount.clone(),
-                        user: user.clone(),
-                    };
-                    self.disk_usage_scans.remove(&key);
-                    self.disk_usage_errors.remove(&key);
-                    self.disk_usage_cache.insert(
-                        key.clone(),
-                        DiskUsageCacheEntry {
-                            rows,
-                            captured_at: SystemTime::now(),
-                        },
-                    );
-                    persist_disk_usage_cache(&self.disk_usage_cache);
-                    if self
-                        .details_disk
-                        .as_ref()
-                        .is_some_and(|details| details.key() == key)
-                    {
-                        let len = self
-                            .disk_usage_cache
-                            .get(&key)
-                            .map_or(0, |cache| cache.rows.len());
-                        clamp_selection(&mut self.disk_usage_table, len);
+            } => {
+                let key = DiskUsageKey {
+                    mount: mount.clone(),
+                    user: user.clone(),
+                };
+                if self
+                    .disk_usage_scans
+                    .get(&key)
+                    .is_none_or(|scan| scan.id != scan_id)
+                {
+                    return;
+                }
+                self.disk_usage_scans.remove(&key);
+                match result {
+                    Ok(mut rows) => {
+                        if is_inconclusive_zero_usage(&rows) {
+                            rows.clear();
+                        }
+                        self.disk_usage_errors.remove(&key);
+                        self.disk_usage_cache.insert(
+                            key.clone(),
+                            DiskUsageCacheEntry {
+                                rows,
+                                captured_at: SystemTime::now(),
+                            },
+                        );
+                        persist_disk_usage_cache(&self.disk_usage_cache);
+                        if self
+                            .details_disk
+                            .as_ref()
+                            .is_some_and(|details| details.key() == key)
+                        {
+                            let len = self
+                                .disk_usage_cache
+                                .get(&key)
+                                .map_or(0, |cache| cache.rows.len());
+                            clamp_selection(&mut self.disk_usage_table, len);
+                        }
+                        self.status = format!("Disk usage scan finished for {user} on {mount}");
                     }
-                    self.status = format!("Disk usage scan finished for {user} on {mount}");
+                    Err(error) => {
+                        self.disk_usage_errors.insert(
+                            key,
+                            DiskUsageError {
+                                message: error.clone(),
+                                occurred_at: SystemTime::now(),
+                            },
+                        );
+                        self.status =
+                            format!("Disk usage scan failed for {user} on {mount}: {error}");
+                    }
                 }
-                Err(error) => {
-                    let key = DiskUsageKey {
-                        mount: mount.clone(),
-                        user: user.clone(),
-                    };
-                    self.disk_usage_scans.remove(&key);
-                    self.disk_usage_errors.insert(
-                        key,
-                        DiskUsageError {
-                            message: error.clone(),
-                            occurred_at: SystemTime::now(),
-                        },
-                    );
-                    self.status = format!("Disk usage scan failed for {user} on {mount}: {error}");
+            }
+            UiMessage::DiskUsageProgress {
+                mount,
+                user,
+                scan_id,
+                progress,
+            } => {
+                let key = DiskUsageKey { mount, user };
+                if let Some(scan) = self.disk_usage_scans.get_mut(&key) {
+                    if scan.id == scan_id {
+                        scan.progress = Some(progress);
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -1295,7 +1350,9 @@ impl AppState {
             Line::from("c: toggle column, x: hide panel, v: show panel, [ ] { } resize."),
             Line::from("Enter on job: details (c cancel, h hold, u release, r requeue)."),
             Line::from("Enter on node: node specs popup."),
-            Line::from("Enter on disk: current-user usage cache; u/r refresh in popup."),
+            Line::from(
+                "Enter on disk: current-user usage cache; u/r refresh, n no-timeout in popup.",
+            ),
             Line::from("t: cycle theme, ? or Esc: close help, q: quit."),
         ];
         frame.render_widget(
@@ -1406,6 +1463,9 @@ impl AppState {
     where
         B: SlurmClient + 'static,
     {
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
         if self.pending_action.is_some() {
             return self.handle_confirmation_key(key, backend, config, tx);
         }
@@ -1569,7 +1629,12 @@ impl AppState {
             KeyCode::Esc | KeyCode::Char('q') => self.details_disk = None,
             KeyCode::Char('u' | 'r') => {
                 if let Some(key) = self.details_disk.as_ref().map(DiskDetails::key) {
-                    self.start_disk_usage_scan(key, backend, tx);
+                    self.start_disk_usage_scan(key, backend, tx, self.disk_usage_timeout, false);
+                }
+            }
+            KeyCode::Char('n') => {
+                if let Some(key) = self.details_disk.as_ref().map(DiskDetails::key) {
+                    self.start_disk_usage_scan(key, backend, tx, None, true);
                 }
             }
             KeyCode::Char('s') => {
@@ -1882,14 +1947,19 @@ impl AppState {
                 rows: Vec::new(),
                 captured_at: None,
                 scan_started_at: None,
+                scan_timeout: None,
+                progress: None,
                 error: None,
             };
         };
         let cache = self.disk_usage_cache.get(&key);
+        let scan = self.disk_usage_scans.get(&key);
         DiskUsageView {
             rows: cache.map_or_else(Vec::new, |cache| cache.rows.clone()),
             captured_at: cache.map(|cache| cache.captured_at),
-            scan_started_at: self.disk_usage_scans.get(&key).map(|scan| scan.started_at),
+            scan_started_at: scan.map(|scan| scan.started_at),
+            scan_timeout: scan.and_then(|scan| scan.timeout),
+            progress: scan.and_then(|scan| scan.progress),
             error: self.disk_usage_errors.get(&key).cloned(),
         }
     }
@@ -2258,7 +2328,7 @@ impl AppState {
         self.details_disk = Some(DiskDetails { mount, user });
         self.disk_usage_table.select(Some(0));
         if !self.disk_usage_cache.contains_key(&key) && !self.disk_usage_scans.contains_key(&key) {
-            self.start_disk_usage_scan(key, backend, tx);
+            self.start_disk_usage_scan(key, backend, tx, self.disk_usage_timeout, false);
         } else if let Some(cache) = self.disk_usage_cache.get(&key) {
             self.status = format!(
                 "Loaded cached disk usage for {} on {} from {}",
@@ -2274,30 +2344,60 @@ impl AppState {
         key: DiskUsageKey,
         backend: Arc<B>,
         tx: mpsc::Sender<UiMessage>,
+        scan_timeout: Option<Duration>,
+        replace_timed_scan: bool,
     ) where
         B: SlurmClient + 'static,
     {
-        if self.disk_usage_scans.contains_key(&key) {
+        if let Some(scan) = self.disk_usage_scans.get(&key) {
+            let replace_running =
+                replace_timed_scan && scan.timeout.is_some() && scan_timeout.is_none();
+            if !replace_running {
+                self.status = format!(
+                    "Disk usage scan already running for {} on {} ({})",
+                    key.user,
+                    key.mount,
+                    disk_usage_timeout_label(scan.timeout)
+                );
+                return;
+            }
+        }
+        if let Some(scan) = self.disk_usage_scans.remove(&key) {
+            scan.handle.abort();
             self.status = format!(
-                "Disk usage scan already running for {} on {}",
+                "Restarting disk usage scan for {} on {} without timeout",
                 key.user, key.mount
             );
-            return;
         }
         self.disk_usage_errors.remove(&key);
+        let scan_id = self.next_disk_usage_scan_id;
+        self.next_disk_usage_scan_id = self.next_disk_usage_scan_id.wrapping_add(1);
+        let handle = spawn_disk_usage(
+            backend,
+            key.mount.clone(),
+            key.user.clone(),
+            scan_id,
+            scan_timeout,
+            tx,
+        );
+        let mount = key.mount.clone();
+        let user = key.user.clone();
         self.disk_usage_scans.insert(
-            key.clone(),
+            key,
             DiskUsageScan {
+                id: scan_id,
                 started_at: Instant::now(),
+                timeout: scan_timeout,
+                progress: None,
+                handle,
             },
         );
         self.status = format!(
             "Scanning disk usage for {} on {} ({})",
-            key.user,
-            key.mount,
-            disk_usage_timeout_label(self.disk_usage_timeout)
+            user,
+            mount,
+            disk_usage_timeout_label(scan_timeout)
         );
-        spawn_disk_usage(backend, key.mount, key.user, self.disk_usage_timeout, tx);
     }
 
     fn summary_display_rows(&self) -> Vec<SummaryDisplayRow> {
@@ -2567,13 +2667,11 @@ impl AppState {
         let rows = self.sorted_disk_usage_rows();
         clamp_selection(&mut self.disk_usage_table, rows.len());
 
-        let status = self.disk_usage_status(&view);
+        let status = Self::disk_usage_status(&view);
         let block = self.themed_panel_block(
             format!(
-                "Disk Usage: {} | user={} | rows={} | {status} | u update | Esc close",
-                details.mount,
-                details.user,
-                rows.len()
+                "Disk Usage: {} | user={} | {status} | u refresh | n no-timeout | Esc close",
+                details.mount, details.user,
             ),
             true,
         );
@@ -2589,7 +2687,7 @@ impl AppState {
             draw_disk_usage_message(
                 frame,
                 inner,
-                disk_usage_loading_lines(self.disk_usage_timeout),
+                disk_usage_loading_lines(view.scan_timeout, view.progress),
             );
             return;
         }
@@ -2599,6 +2697,24 @@ impl AppState {
             return;
         }
 
+        let table_area = if view.is_loading() {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(3)])
+                .split(inner);
+            frame.render_widget(
+                Paragraph::new(disk_usage_scan_progress_lines(
+                    view.scan_timeout,
+                    view.progress,
+                ))
+                .wrap(Wrap { trim: true }),
+                chunks[0],
+            );
+            chunks[1]
+        } else {
+            inner
+        };
+
         let headers = ["USER", "USED", "ENTRIES"];
         let constraints = vec![
             Constraint::Percentage(45),
@@ -2607,9 +2723,9 @@ impl AppState {
         ];
         self.modal_table_hits.push(ModalTableHit {
             table: ModalTable::DiskUsage,
-            area: inner,
+            area: table_area,
         });
-        self.add_modal_header_hits(inner, ModalTable::DiskUsage, &constraints);
+        self.add_modal_header_hits(table_area, ModalTable::DiskUsage, &constraints);
         let header_cells = decorate_headers(
             &headers,
             disk_usage_column_to_index(self.disk_usage_sort),
@@ -2624,13 +2740,13 @@ impl AppState {
                     .border_style(self.theme.border_focused),
             )
             .row_highlight_style(self.theme.highlight);
-        frame.render_stateful_widget(table, inner, &mut self.disk_usage_table);
+        frame.render_stateful_widget(table, table_area, &mut self.disk_usage_table);
     }
 
-    fn disk_usage_status(&self, view: &DiskUsageView) -> String {
+    fn disk_usage_status(view: &DiskUsageView) -> String {
         if let Some(started_at) = view.scan_started_at {
             let elapsed = started_at.elapsed().as_secs();
-            return match self.disk_usage_timeout {
+            let status = match view.scan_timeout {
                 Some(limit) => format!(
                     "{} scanning {}s/{}s",
                     spinner(started_at),
@@ -2639,16 +2755,27 @@ impl AppState {
                 ),
                 None => format!("{} scanning {}s/no timeout", spinner(started_at), elapsed),
             };
+            let status = if let Some(progress) = view.progress {
+                format!("{status}; {}", disk_usage_progress_summary(progress))
+            } else {
+                status
+            };
+            return view.captured_at.map_or(status.clone(), |captured_at| {
+                format!("{status}; showing cached {}", format_timestamp(captured_at))
+            });
         }
         if view.error.is_some() && view.captured_at.is_some() {
-            return "cached; update failed".to_string();
+            return view.captured_at.map_or_else(
+                || "cached; update failed".to_string(),
+                |captured_at| format!("cached at {}; update failed", format_timestamp(captured_at)),
+            );
         }
         if view.error.is_some() {
             return "error".to_string();
         }
         view.captured_at.map_or_else(
             || "not scanned".to_string(),
-            |captured_at| format!("cached {}", format_timestamp(captured_at)),
+            |captured_at| format!("cached at {}", format_timestamp(captured_at)),
         )
     }
 
@@ -2832,23 +2959,84 @@ fn disk_usage_error_lines(error: &DiskUsageError) -> Vec<Line<'static>> {
         Line::from(error.message.clone()),
         Line::from(format!("Failed at {}", format_timestamp(error.occurred_at))),
         Line::from(""),
-        Line::from(
-            "Press u to retry; start with --disk-usage-no-timeout for unlimited background scans.",
-        ),
+        Line::from("Press u to retry, or n to retry without a timeout."),
         Line::from("Esc close"),
     ]
 }
 
-fn disk_usage_loading_lines(timeout: Option<Duration>) -> Vec<Line<'static>> {
+fn disk_usage_loading_lines(
+    timeout: Option<Duration>,
+    progress: Option<DiskUsageProgress>,
+) -> Vec<Line<'static>> {
     vec![
-        Line::from("Scanning visible files owned by the current user..."),
-        Line::from("Using quota/user-directory shortcuts first, then a streaming background scan."),
-        Line::from("No command line is shown here; this work runs in the background."),
+        Line::from(disk_usage_progress_detail(progress)),
         Line::from(format!(
             "Timeout mode: {}",
             disk_usage_timeout_label(timeout)
         )),
     ]
+}
+
+fn disk_usage_scan_progress_lines(
+    timeout: Option<Duration>,
+    progress: Option<DiskUsageProgress>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(format!(
+        "Refreshing in background; timeout {}.",
+        disk_usage_timeout_label(timeout)
+    ))];
+    lines.push(progress.map_or_else(
+        || Line::from("Preparing disk usage scan."),
+        |progress| Line::from(disk_usage_progress_detail(Some(progress))),
+    ));
+    lines
+}
+
+fn disk_usage_progress_detail(progress: Option<DiskUsageProgress>) -> String {
+    progress.map_or_else(
+        || "Preparing disk usage scan.".to_string(),
+        |progress| match progress.stage {
+            DiskUsageProgressStage::Starting => "Preparing disk usage scan.".to_string(),
+            DiskUsageProgressStage::Quota => {
+                "Checking filesystem quota for the current user.".to_string()
+            }
+            DiskUsageProgressStage::UserDirectory => {
+                "Measuring the user's directory with du; item counts are not available for this fast path.".to_string()
+            }
+            DiskUsageProgressStage::Traversal => {
+                if progress.scanned_entries == 0 {
+                    "Scanning filesystem tree for files owned by the current user.".to_string()
+                } else {
+                    format!(
+                        "Scanned {} items; matched {} owned entries ({}) so far.",
+                        progress.scanned_entries,
+                        progress.matched_entries,
+                        human_bytes(progress.bytes)
+                    )
+                }
+            }
+        },
+    )
+}
+
+fn disk_usage_progress_summary(progress: DiskUsageProgress) -> String {
+    match progress.stage {
+        DiskUsageProgressStage::Starting => "starting".to_string(),
+        DiskUsageProgressStage::Quota => "checking quota".to_string(),
+        DiskUsageProgressStage::UserDirectory => "measuring user directory with du".to_string(),
+        DiskUsageProgressStage::Traversal => {
+            if progress.scanned_entries == 0 {
+                "traversing filesystem".to_string()
+            } else {
+                format!(
+                    "scanned {} items; matched {} ({})",
+                    progress.scanned_entries,
+                    progress.matched_entries,
+                    human_bytes(progress.bytes)
+                )
+            }
+        }
+    }
 }
 
 fn disk_usage_empty_lines(user: &str) -> Vec<Line<'static>> {
@@ -2890,11 +3078,23 @@ fn load_disk_usage_cache() -> HashMap<DiskUsageKey, DiskUsageCacheEntry> {
     if cache_file.version != 1 {
         return HashMap::new();
     }
-    cache_file
+    let mut dropped_inconclusive = false;
+    let cache = cache_file
         .entries
         .into_iter()
-        .map(|entry| (entry.key, entry.value))
-        .collect()
+        .filter_map(|entry| {
+            if is_inconclusive_zero_usage(&entry.value.rows) {
+                dropped_inconclusive = true;
+                None
+            } else {
+                Some((entry.key, entry.value))
+            }
+        })
+        .collect();
+    if dropped_inconclusive {
+        persist_disk_usage_cache(&cache);
+    }
+    cache
 }
 
 fn persist_disk_usage_cache(cache: &HashMap<DiskUsageKey, DiskUsageCacheEntry>) {
@@ -2940,10 +3140,14 @@ fn disk_usage_cache_path() -> Option<PathBuf> {
         })
 }
 
+fn is_inconclusive_zero_usage(rows: &[DiskUserUsage]) -> bool {
+    rows.len() == 1 && rows[0].bytes == 0 && rows[0].entries == 0
+}
+
 fn friendly_disk_usage_error(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
-        return "Usage scan timed out. This filesystem is too large to scan directly, and no quick user-directory result was available. Restart with --disk-usage-no-timeout to let scans run until completion.".to_string();
+        return "Usage scan timed out. This filesystem is too large to scan directly, and no quick user-directory result was available. Press n in this popup, or start with --disk-usage-no-timeout, to let scans run until completion.".to_string();
     }
     if lower.contains("find ") || lower.contains(" du ") || lower.contains("backend command") {
         return "Usage scan failed in the background. Command details are hidden; try a narrower user/project directory or a filesystem quota tool.".to_string();
@@ -2952,37 +3156,30 @@ fn friendly_disk_usage_error(error: &str) -> String {
 }
 
 fn format_timestamp(time: SystemTime) -> String {
-    let Ok(duration) = time.duration_since(UNIX_EPOCH) else {
-        return "before 1970-01-01 00:00 UTC".to_string();
-    };
-    let total_seconds = duration.as_secs();
-    let days = i64::try_from(total_seconds / 86_400).unwrap_or(i64::MAX);
-    let seconds_of_day = total_seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    let hour = seconds_of_day / 3_600;
-    let minute = (seconds_of_day % 3_600) / 60;
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+    let utc = OffsetDateTime::from(time);
+    let offset = UtcOffset::local_offset_at(utc).unwrap_or(UtcOffset::UTC);
+    let local = utc.to_offset(offset);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02} {}",
+        local.year(),
+        u8::from(local.month()),
+        local.day(),
+        local.hour(),
+        local.minute(),
+        format_utc_offset(offset)
+    )
 }
 
-fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
-    let days = days_since_epoch + 719_468;
-    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
-    let day_of_era = days - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = i32::try_from(year_of_era + era * 400).unwrap_or(i32::MAX);
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    if month <= 2 {
-        year += 1;
+fn format_utc_offset(offset: UtcOffset) -> String {
+    let seconds = offset.whole_seconds();
+    if seconds == 0 {
+        return "UTC".to_string();
     }
-    (
-        year,
-        u32::try_from(month).unwrap_or(1),
-        u32::try_from(day).unwrap_or(1),
-    )
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let abs_seconds = seconds.unsigned_abs();
+    let hours = abs_seconds / 3_600;
+    let minutes = (abs_seconds % 3_600) / 60;
+    format!("UTC{sign}{hours:02}:{minutes:02}")
 }
 
 fn summary_table_row(row: &SummaryDisplayRow, style: Style) -> Row<'static> {
