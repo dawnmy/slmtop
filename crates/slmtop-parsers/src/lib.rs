@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use regex::Regex;
-use slmtop_core::{AccountingRecord, CpuCounts, DiskInfo, DiskLabel, GpuMap, Job, MemoryMb, Node};
+use slmtop_core::{
+    AccountingRecord, CpuCounts, DiskInfo, DiskLabel, DiskUserUsage, GpuMap, Job, MemoryMb, Node,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parsed<T> {
@@ -53,6 +55,7 @@ pub fn parse_squeue(output: &str) -> Parsed<Job> {
                 .get(11)
                 .filter(|value| !value.is_empty())
                 .map(|value| (*value).to_string()),
+            time_limit: parts.get(12).map_or_else(String::new, |s| (*s).to_string()),
         });
     }
     Parsed::new(jobs, warnings)
@@ -91,7 +94,9 @@ pub fn parse_sinfo(output: &str) -> Parsed<Node> {
             memory_reserved: reserved,
             memory_free: free,
             gpus: parse_gpu_map(parts[6]),
-            gpus_allocated: parts.get(8).map_or_else(GpuMap::default, |s| parse_gpu_map(s)),
+            gpus_allocated: parts
+                .get(8)
+                .map_or_else(GpuMap::default, |s| parse_gpu_map(s)),
             gres_raw: parts[6].to_string(),
             reason: parts
                 .get(7)
@@ -266,10 +271,7 @@ pub fn parse_df(output: &str) -> Vec<DiskInfo> {
     let mut disks = Vec::new();
     for line in output.lines() {
         let line = line.trim();
-        if line.is_empty()
-            || line.starts_with("Filesystem")
-            || line.starts_with("filesystem")
-        {
+        if line.is_empty() || line.starts_with("Filesystem") || line.starts_with("filesystem") {
             continue;
         }
         let parts: Vec<_> = line.split_whitespace().collect();
@@ -285,10 +287,28 @@ pub fn parse_df(output: &str) -> Vec<DiskInfo> {
         // Skip pseudo filesystems
         if matches!(
             fstype.as_str(),
-            "tmpfs" | "devtmpfs" | "sysfs" | "proc" | "devpts" | "cgroup" | "cgroup2"
-                | "securityfs" | "pstore" | "efivarfs" | "bpf" | "autofs"
-                | "hugetlbfs" | "mqueue" | "debugfs" | "tracefs" | "fusectl"
-                | "configfs" | "ramfs" | "rpc_pipefs" | "nsfs" | "overlay"
+            "tmpfs"
+                | "devtmpfs"
+                | "sysfs"
+                | "proc"
+                | "devpts"
+                | "cgroup"
+                | "cgroup2"
+                | "securityfs"
+                | "pstore"
+                | "efivarfs"
+                | "bpf"
+                | "autofs"
+                | "hugetlbfs"
+                | "mqueue"
+                | "debugfs"
+                | "tracefs"
+                | "fusectl"
+                | "configfs"
+                | "ramfs"
+                | "rpc_pipefs"
+                | "nsfs"
+                | "overlay"
         ) {
             continue;
         }
@@ -305,6 +325,152 @@ pub fn parse_df(output: &str) -> Vec<DiskInfo> {
     disks
 }
 
+#[must_use]
+pub fn parse_find_user_usage(output: &str) -> Vec<DiskUserUsage> {
+    let mut usage: BTreeMap<String, DiskUserUsage> = BTreeMap::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let Some(user) = fields.next().map(str::trim).filter(|user| !user.is_empty()) else {
+            continue;
+        };
+        let blocks = fields
+            .next()
+            .map(str::trim)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let entry = usage
+            .entry(user.to_string())
+            .or_insert_with(|| DiskUserUsage {
+                user: user.to_string(),
+                bytes: 0,
+                entries: 0,
+            });
+        entry.bytes = entry.bytes.saturating_add(blocks.saturating_mul(512));
+        entry.entries = entry.entries.saturating_add(1);
+    }
+
+    let mut rows = usage.into_values().collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.user.cmp(&b.user)));
+    rows
+}
+
+#[must_use]
+pub fn parse_find_current_user_usage(output: &str, user: &str) -> Vec<DiskUserUsage> {
+    let mut row = DiskUserUsage {
+        user: user.to_string(),
+        bytes: 0,
+        entries: 0,
+    };
+    for line in output.lines() {
+        let Ok(blocks) = line.trim().parse::<u64>() else {
+            continue;
+        };
+        row.bytes = row.bytes.saturating_add(blocks.saturating_mul(512));
+        row.entries = row.entries.saturating_add(1);
+    }
+    if row.entries == 0 {
+        Vec::new()
+    } else {
+        vec![row]
+    }
+}
+
+#[must_use]
+pub fn parse_du_user_usage(output: &str, user: &str) -> Vec<DiskUserUsage> {
+    let Some(bytes) = output
+        .lines()
+        .find_map(|line| line.split_whitespace().next()?.parse::<u64>().ok())
+    else {
+        return Vec::new();
+    };
+    vec![DiskUserUsage {
+        user: user.to_string(),
+        bytes,
+        entries: 0,
+    }]
+}
+
+#[must_use]
+pub fn parse_lfs_quota_user_usage(output: &str, user: &str) -> Vec<DiskUserUsage> {
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty()
+            || line.starts_with("Disk quotas")
+            || line.starts_with("Filesystem")
+            || line.starts_with("none")
+        {
+            continue;
+        }
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        let used_token = if tokens.first().is_some_and(|token| token.starts_with('/')) {
+            tokens.get(1).copied()
+        } else {
+            tokens.first().copied()
+        };
+        if let Some(bytes) = used_token.and_then(quota_size_to_bytes) {
+            return vec![DiskUserUsage {
+                user: user.to_string(),
+                bytes,
+                entries: 0,
+            }];
+        }
+    }
+    Vec::new()
+}
+
+fn quota_size_to_bytes(value: &str) -> Option<u64> {
+    let mut number = String::new();
+    let mut unit = None;
+    for ch in value.trim().chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            number.push(ch);
+        } else if ch.is_ascii_alphabetic() {
+            unit = Some(ch.to_ascii_uppercase());
+            break;
+        }
+    }
+    if number.is_empty() {
+        return None;
+    }
+    let (whole, fraction, scale) = decimal_parts_u64(&number);
+    let multiplier = match unit.unwrap_or('B') {
+        'K' => 1024,
+        'M' => 1024_u64.pow(2),
+        'G' => 1024_u64.pow(3),
+        'T' => 1024_u64.pow(4),
+        'P' => 1024_u64.pow(5),
+        _ => 1,
+    };
+    Some(
+        whole
+            .saturating_mul(multiplier)
+            .saturating_add(fraction.saturating_mul(multiplier) / scale),
+    )
+}
+
+fn decimal_parts_u64(number: &str) -> (u64, u64, u64) {
+    let Some((whole, fraction)) = number.split_once('.') else {
+        return (number.parse().unwrap_or(0), 0, 1);
+    };
+    let fraction_digits = fraction
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    if fraction_digits.is_empty() {
+        return (whole.parse().unwrap_or(0), 0, 1);
+    }
+    let scale = 10_u64.saturating_pow(u32::try_from(fraction_digits.len()).unwrap_or(0));
+    (
+        whole.parse().unwrap_or(0),
+        fraction_digits.parse().unwrap_or(0),
+        scale,
+    )
+}
+
 fn classify_disk(source: &str, fstype: &str) -> DiskLabel {
     match fstype {
         "nfs" | "nfs4" | "nfs3" | "cifs" | "smb" | "smbfs" => DiskLabel::Nfs,
@@ -319,7 +485,7 @@ fn classify_disk(source: &str, fstype: &str) -> DiskLabel {
                 let dev = source
                     .trim_start_matches("/dev/")
                     .chars()
-                    .take_while(|c| c.is_ascii_alphabetic())
+                    .take_while(char::is_ascii_alphabetic)
                     .collect::<String>();
                 let rotational_path = format!("/sys/block/{dev}/queue/rotational");
                 match std::fs::read_to_string(&rotational_path) {
@@ -389,5 +555,49 @@ mod tests {
         assert_eq!(parsed.rows[0].job_id, "123");
         assert_eq!(parsed.rows[0].cpus, 16);
         assert_eq!(parsed.rows[0].memory.0, 8192);
+    }
+
+    #[test]
+    fn parses_find_user_usage() {
+        let rows = parse_find_user_usage("alice\t2\nbob\t4\nalice\t3\n");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].user, "alice");
+        assert_eq!(rows[0].bytes, 5 * 512);
+        assert_eq!(rows[0].entries, 2);
+        assert_eq!(rows[1].user, "bob");
+        assert_eq!(rows[1].bytes, 4 * 512);
+    }
+
+    #[test]
+    fn parses_find_current_user_usage() {
+        let rows = parse_find_current_user_usage("2\n0\n4\ninvalid\n", "alice");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user, "alice");
+        assert_eq!(rows[0].bytes, 6 * 512);
+        assert_eq!(rows[0].entries, 3);
+    }
+
+    #[test]
+    fn parses_du_user_usage() {
+        let rows = parse_du_user_usage("4096\t/vol/projects/alice\n", "alice");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user, "alice");
+        assert_eq!(rows[0].bytes, 4096);
+        assert_eq!(rows[0].entries, 0);
+    }
+
+    #[test]
+    fn parses_lfs_quota_user_usage() {
+        let output = "\
+Disk quotas for usr alice (uid 1000):
+     Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace
+/vol/projects
+                 1.5G       0       0       -       10       0       0       -
+";
+        let rows = parse_lfs_quota_user_usage(output, "alice");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].user, "alice");
+        assert_eq!(rows[0].bytes, 1_610_612_736);
+        assert_eq!(rows[0].entries, 0);
     }
 }

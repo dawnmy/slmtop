@@ -1,8 +1,12 @@
 //! Terminal UI for slmtop.
 
+use std::collections::HashMap;
+use std::env;
+use std::fs;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
@@ -18,10 +22,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
+use serde::{Deserialize, Serialize};
 use slmtop_core::{
-    filter_jobs, filter_nodes, sort_jobs, sort_nodes, AccountingColumn,
-    ClusterSnapshot, FilterExpression, GpuSummary, Job, JobColumn, Node, NodeColumn, PanelId,
-    SortDirection,
+    filter_jobs, filter_nodes, parse_slurm_time, sort_jobs, sort_nodes, AccountingColumn,
+    ClusterSnapshot, DiskInfo, DiskUserUsage, FilterExpression, GpuSummary, Job, JobColumn, Node,
+    NodeColumn, OwnerSummary, PanelId, SortDirection,
 };
 use slmtop_slurm::{refresh_backend, BackendConfig, SlurmClient, SlurmError, SnapshotEnvelope};
 use thiserror::Error;
@@ -52,10 +57,10 @@ pub enum ThemeName {
 }
 
 impl ThemeName {
-    pub fn from_str(s: &str) -> Self {
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "monokai" => Self::Monokai,
-            "catppuccin" => Self::Catppuccin,
             "onedark" | "onedarkpro" => Self::OneDarkPro,
             "nightowl" | "night_owl" => Self::NightOwl,
             "tokyonight" | "tokyo_night" => Self::TokyoNight,
@@ -129,11 +134,21 @@ impl Theme {
 
     fn classic() -> Self {
         Self {
-            border_focused: Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            border_focused: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
             border_unfocused: Style::default().fg(Color::DarkGray),
-            header_style: Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
-            highlight: Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD),
-            status_badge: Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+            header_style: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            highlight: Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+            status_badge: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
             state_running: Style::default().fg(Color::Green),
             state_pending: Style::default().fg(Color::Yellow),
             state_failed: Style::default().fg(Color::Red),
@@ -145,7 +160,9 @@ impl Theme {
             summary_others: Style::default().fg(Color::Yellow),
             _bar_filled: Color::Cyan,
             _bar_empty: Color::DarkGray,
-            warning_border: Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            warning_border: Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         }
     }
 
@@ -158,9 +175,15 @@ impl Theme {
         Self {
             border_focused: Style::default().fg(cyan).add_modifier(Modifier::BOLD),
             border_unfocused: Style::default().fg(Color::Rgb(117, 113, 94)),
-            header_style: Style::default().fg(Color::Black).bg(cyan).add_modifier(Modifier::BOLD),
+            header_style: Style::default()
+                .fg(Color::Black)
+                .bg(cyan)
+                .add_modifier(Modifier::BOLD),
             highlight: Style::default().bg(bg_sel).add_modifier(Modifier::BOLD),
-            status_badge: Style::default().fg(Color::Black).bg(green).add_modifier(Modifier::BOLD),
+            status_badge: Style::default()
+                .fg(Color::Black)
+                .bg(green)
+                .add_modifier(Modifier::BOLD),
             state_running: Style::default().fg(green),
             state_pending: Style::default().fg(orange),
             state_failed: Style::default().fg(magenta),
@@ -186,9 +209,15 @@ impl Theme {
         Self {
             border_focused: Style::default().fg(mauve).add_modifier(Modifier::BOLD),
             border_unfocused: Style::default().fg(surface1),
-            header_style: Style::default().fg(Color::Rgb(30, 30, 46)).bg(mauve).add_modifier(Modifier::BOLD),
+            header_style: Style::default()
+                .fg(Color::Rgb(30, 30, 46))
+                .bg(mauve)
+                .add_modifier(Modifier::BOLD),
             highlight: Style::default().bg(surface1).add_modifier(Modifier::BOLD),
-            status_badge: Style::default().fg(Color::Rgb(30, 30, 46)).bg(mauve).add_modifier(Modifier::BOLD),
+            status_badge: Style::default()
+                .fg(Color::Rgb(30, 30, 46))
+                .bg(mauve)
+                .add_modifier(Modifier::BOLD),
             state_running: Style::default().fg(green),
             state_pending: Style::default().fg(peach),
             state_failed: Style::default().fg(red),
@@ -214,9 +243,15 @@ impl Theme {
         Self {
             border_focused: Style::default().fg(blue).add_modifier(Modifier::BOLD),
             border_unfocused: Style::default().fg(gutter),
-            header_style: Style::default().fg(Color::Rgb(40, 44, 52)).bg(blue).add_modifier(Modifier::BOLD),
+            header_style: Style::default()
+                .fg(Color::Rgb(40, 44, 52))
+                .bg(blue)
+                .add_modifier(Modifier::BOLD),
             highlight: Style::default().bg(gutter).add_modifier(Modifier::BOLD),
-            status_badge: Style::default().fg(Color::Rgb(40, 44, 52)).bg(blue).add_modifier(Modifier::BOLD),
+            status_badge: Style::default()
+                .fg(Color::Rgb(40, 44, 52))
+                .bg(blue)
+                .add_modifier(Modifier::BOLD),
             state_running: Style::default().fg(green),
             state_pending: Style::default().fg(orange),
             state_failed: Style::default().fg(red),
@@ -242,9 +277,15 @@ impl Theme {
         Self {
             border_focused: Style::default().fg(cyan).add_modifier(Modifier::BOLD),
             border_unfocused: Style::default().fg(Color::Rgb(68, 98, 130)),
-            header_style: Style::default().fg(Color::Rgb(1, 22, 39)).bg(cyan).add_modifier(Modifier::BOLD),
+            header_style: Style::default()
+                .fg(Color::Rgb(1, 22, 39))
+                .bg(cyan)
+                .add_modifier(Modifier::BOLD),
             highlight: Style::default().bg(surface).add_modifier(Modifier::BOLD),
-            status_badge: Style::default().fg(Color::Rgb(1, 22, 39)).bg(cyan).add_modifier(Modifier::BOLD),
+            status_badge: Style::default()
+                .fg(Color::Rgb(1, 22, 39))
+                .bg(cyan)
+                .add_modifier(Modifier::BOLD),
             state_running: Style::default().fg(cyan),
             state_pending: Style::default().fg(yellow),
             state_failed: Style::default().fg(red),
@@ -270,9 +311,17 @@ impl Theme {
         Self {
             border_focused: Style::default().fg(blue).add_modifier(Modifier::BOLD),
             border_unfocused: Style::default().fg(bg_highlight),
-            header_style: Style::default().fg(Color::Rgb(26, 27, 38)).bg(blue).add_modifier(Modifier::BOLD),
-            highlight: Style::default().bg(bg_highlight).add_modifier(Modifier::BOLD),
-            status_badge: Style::default().fg(Color::Rgb(26, 27, 38)).bg(blue).add_modifier(Modifier::BOLD),
+            header_style: Style::default()
+                .fg(Color::Rgb(26, 27, 38))
+                .bg(blue)
+                .add_modifier(Modifier::BOLD),
+            highlight: Style::default()
+                .bg(bg_highlight)
+                .add_modifier(Modifier::BOLD),
+            status_badge: Style::default()
+                .fg(Color::Rgb(26, 27, 38))
+                .bg(blue)
+                .add_modifier(Modifier::BOLD),
             state_running: Style::default().fg(green),
             state_pending: Style::default().fg(orange),
             state_failed: Style::default().fg(red),
@@ -298,9 +347,17 @@ impl Theme {
         Self {
             border_focused: Style::default().fg(purple).add_modifier(Modifier::BOLD),
             border_unfocused: Style::default().fg(bg_highlight),
-            header_style: Style::default().fg(Color::Rgb(40, 42, 54)).bg(purple).add_modifier(Modifier::BOLD),
-            highlight: Style::default().bg(bg_highlight).add_modifier(Modifier::BOLD),
-            status_badge: Style::default().fg(Color::Rgb(40, 42, 54)).bg(purple).add_modifier(Modifier::BOLD),
+            header_style: Style::default()
+                .fg(Color::Rgb(40, 42, 54))
+                .bg(purple)
+                .add_modifier(Modifier::BOLD),
+            highlight: Style::default()
+                .bg(bg_highlight)
+                .add_modifier(Modifier::BOLD),
+            status_badge: Style::default()
+                .fg(Color::Rgb(40, 42, 54))
+                .bg(purple)
+                .add_modifier(Modifier::BOLD),
             state_running: Style::default().fg(green),
             state_pending: Style::default().fg(orange),
             state_failed: Style::default().fg(red),
@@ -360,7 +417,12 @@ where
 {
     let (tx, mut rx) = mpsc::channel(16);
     spawn_refresh_loop(Arc::clone(backend), config.clone(), tx.clone());
-    let mut app = AppState::new(config.current_user.clone(), config.refresh_interval, options.theme);
+    let mut app = AppState::new(
+        config.current_user.clone(),
+        config.refresh_interval,
+        config.disk_usage_timeout,
+        options.theme,
+    );
 
     loop {
         while let Ok(message) = rx.try_recv() {
@@ -467,11 +529,40 @@ fn spawn_action<B>(
     });
 }
 
+fn spawn_disk_usage<B>(
+    backend: Arc<B>,
+    mount: String,
+    user: String,
+    scan_timeout: Option<Duration>,
+    tx: mpsc::Sender<UiMessage>,
+) where
+    B: SlurmClient + 'static,
+{
+    tokio::spawn(async move {
+        let result = backend
+            .disk_user_usage(&mount, &user, scan_timeout)
+            .await
+            .map_err(|error| friendly_disk_usage_error(&error.to_string()));
+        let _ = tx
+            .send(UiMessage::DiskUsage {
+                mount,
+                user,
+                result,
+            })
+            .await;
+    });
+}
+
 #[derive(Debug)]
 enum UiMessage {
     Snapshot(Box<SnapshotEnvelope>),
     Error(String),
     ActionResult(String),
+    DiskUsage {
+        mount: String,
+        user: String,
+        result: std::result::Result<Vec<DiskUserUsage>, String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -513,6 +604,112 @@ enum GpuColumn {
     Active,
     Reserved,
     Free,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskColumn {
+    Usage,
+    Path,
+    Type,
+    Space,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserJobColumn {
+    JobId,
+    Name,
+    Node,
+    Cpus,
+    Gpus,
+    Memory,
+    Time,
+    Limit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserJobSection {
+    Running,
+    Pending,
+}
+
+impl UserJobSection {
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Running => Self::Pending,
+            Self::Pending => Self::Running,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiskUsageColumn {
+    User,
+    Used,
+    Entries,
+}
+
+#[derive(Debug, Clone)]
+struct DiskDetails {
+    mount: String,
+    user: String,
+}
+
+impl DiskDetails {
+    fn key(&self) -> DiskUsageKey {
+        DiskUsageKey {
+            mount: self.mount.clone(),
+            user: self.user.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct DiskUsageKey {
+    mount: String,
+    user: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiskUsageCacheEntry {
+    rows: Vec<DiskUserUsage>,
+    captured_at: SystemTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiskUsageCacheFile {
+    version: u8,
+    entries: Vec<DiskUsageCacheFileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiskUsageCacheFileEntry {
+    key: DiskUsageKey,
+    value: DiskUsageCacheEntry,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiskUsageScan {
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct DiskUsageError {
+    message: String,
+    occurred_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+struct DiskUsageView {
+    rows: Vec<DiskUserUsage>,
+    captured_at: Option<SystemTime>,
+    scan_started_at: Option<Instant>,
+    error: Option<DiskUsageError>,
+}
+
+impl DiskUsageView {
+    const fn is_loading(&self) -> bool {
+        self.scan_started_at.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -563,6 +760,7 @@ impl PanelUiState {
 struct AppState {
     current_user: String,
     refresh_interval: Duration,
+    disk_usage_timeout: Option<Duration>,
     snapshot: Option<SnapshotEnvelope>,
     last_error: Option<String>,
     status: String,
@@ -572,6 +770,9 @@ struct AppState {
     show_help: bool,
     details_job: Option<String>,
     details_node: Option<String>,
+    details_gpu: Option<String>,
+    details_user: Option<String>,
+    details_disk: Option<DiskDetails>,
     pending_action: Option<PendingAction>,
     left_percent: u16,
     top_percent: u16,
@@ -579,21 +780,40 @@ struct AppState {
     jobs_sort: JobColumn,
     nodes_sort: NodeColumn,
     gpu_sort: GpuColumn,
+    disk_sort: DiskColumn,
     accounting_sort: AccountingColumn,
+    user_details_sort: UserJobColumn,
+    disk_usage_sort: DiskUsageColumn,
     directions: [SortDirection; 5],
+    user_details_direction: SortDirection,
+    disk_usage_direction: SortDirection,
+    user_details_section: UserJobSection,
     jobs_table: TableState,
     nodes_table: TableState,
     gpus_table: TableState,
     disks_table: TableState,
     summary_table: TableState,
+    user_running_table: TableState,
+    user_pending_table: TableState,
+    disk_usage_table: TableState,
+    disk_usage_cache: HashMap<DiskUsageKey, DiskUsageCacheEntry>,
+    disk_usage_scans: HashMap<DiskUsageKey, DiskUsageScan>,
+    disk_usage_errors: HashMap<DiskUsageKey, DiskUsageError>,
     panel_areas: [Option<Rect>; 5],
     header_hits: Vec<HeaderHit>,
+    modal_header_hits: Vec<ModalHeaderHit>,
+    modal_table_hits: Vec<ModalTableHit>,
     theme_name: ThemeName,
     theme: Theme,
 }
 
 impl AppState {
-    fn new(current_user: String, refresh_interval: Duration, theme_name: ThemeName) -> Self {
+    fn new(
+        current_user: String,
+        refresh_interval: Duration,
+        disk_usage_timeout: Option<Duration>,
+        theme_name: ThemeName,
+    ) -> Self {
         let mut jobs_table = TableState::default();
         jobs_table.select(Some(0));
         let mut nodes_table = TableState::default();
@@ -604,9 +824,16 @@ impl AppState {
         disks_table.select(Some(0));
         let mut summary_table = TableState::default();
         summary_table.select(Some(0));
+        let mut user_running_table = TableState::default();
+        user_running_table.select(Some(0));
+        let mut user_pending_table = TableState::default();
+        user_pending_table.select(Some(0));
+        let mut disk_usage_table = TableState::default();
+        disk_usage_table.select(Some(0));
         Self {
             current_user,
             refresh_interval,
+            disk_usage_timeout,
             snapshot: None,
             last_error: None,
             status: "Starting Slurm refresh...".to_string(),
@@ -616,6 +843,9 @@ impl AppState {
             show_help: false,
             details_job: None,
             details_node: None,
+            details_gpu: None,
+            details_user: None,
+            details_disk: None,
             pending_action: None,
             left_percent: 55,
             top_percent: 68,
@@ -623,21 +853,40 @@ impl AppState {
                 PanelUiState::new(10),
                 PanelUiState::new(8),
                 PanelUiState::new(5),
-                PanelUiState::new(3), // Disks
+                PanelUiState::new(4),
                 PanelUiState::new(8),
             ],
-            jobs_sort: JobColumn::State,
+            jobs_sort: JobColumn::JobId,
             nodes_sort: NodeColumn::State,
             gpu_sort: GpuColumn::Type,
+            disk_sort: DiskColumn::Space,
             accounting_sort: AccountingColumn::JobId,
-            directions: [SortDirection::Asc; 5],
+            user_details_sort: UserJobColumn::JobId,
+            disk_usage_sort: DiskUsageColumn::Used,
+            directions: {
+                let mut dirs = [SortDirection::Asc; 5];
+                dirs[PanelId::Jobs.index()] = SortDirection::Desc;
+                dirs[PanelId::Disks.index()] = SortDirection::Desc;
+                dirs
+            },
+            user_details_direction: SortDirection::Desc,
+            disk_usage_direction: SortDirection::Desc,
+            user_details_section: UserJobSection::Running,
             jobs_table,
             nodes_table,
             gpus_table,
             disks_table,
             summary_table,
+            user_running_table,
+            user_pending_table,
+            disk_usage_table,
+            disk_usage_cache: load_disk_usage_cache(),
+            disk_usage_scans: HashMap::new(),
+            disk_usage_errors: HashMap::new(),
             panel_areas: [None, None, None, None, None],
             header_hits: Vec::new(),
+            modal_header_hits: Vec::new(),
+            modal_table_hits: Vec::new(),
             theme_name,
             theme: Theme::from_name(theme_name),
         }
@@ -668,11 +917,62 @@ impl AppState {
                 self.status = message;
                 self.pending_action = None;
             }
+            UiMessage::DiskUsage {
+                mount,
+                user,
+                result,
+            } => match result {
+                Ok(rows) => {
+                    let key = DiskUsageKey {
+                        mount: mount.clone(),
+                        user: user.clone(),
+                    };
+                    self.disk_usage_scans.remove(&key);
+                    self.disk_usage_errors.remove(&key);
+                    self.disk_usage_cache.insert(
+                        key.clone(),
+                        DiskUsageCacheEntry {
+                            rows,
+                            captured_at: SystemTime::now(),
+                        },
+                    );
+                    persist_disk_usage_cache(&self.disk_usage_cache);
+                    if self
+                        .details_disk
+                        .as_ref()
+                        .is_some_and(|details| details.key() == key)
+                    {
+                        let len = self
+                            .disk_usage_cache
+                            .get(&key)
+                            .map_or(0, |cache| cache.rows.len());
+                        clamp_selection(&mut self.disk_usage_table, len);
+                    }
+                    self.status = format!("Disk usage scan finished for {user} on {mount}");
+                }
+                Err(error) => {
+                    let key = DiskUsageKey {
+                        mount: mount.clone(),
+                        user: user.clone(),
+                    };
+                    self.disk_usage_scans.remove(&key);
+                    self.disk_usage_errors.insert(
+                        key,
+                        DiskUsageError {
+                            message: error.clone(),
+                            occurred_at: SystemTime::now(),
+                        },
+                    );
+                    self.status = format!("Disk usage scan failed for {user} on {mount}: {error}");
+                }
+            },
         }
     }
 
     fn draw(&mut self, frame: &mut Frame<'_>) {
         self.header_hits.clear();
+        self.modal_header_hits.clear();
+        self.modal_table_hits.clear();
         let root = frame.area();
         let vertical = Layout::default()
             .direction(Direction::Vertical)
@@ -712,6 +1012,15 @@ impl AppState {
         if let Some(node_name) = self.details_node.clone() {
             self.draw_node_details(frame, &node_name, centered_rect(72, 55, root));
         }
+        if let Some(gpu_type) = self.details_gpu.clone() {
+            self.draw_gpu_details(frame, &gpu_type, centered_rect(72, 55, root));
+        }
+        if let Some(user) = self.details_user.clone() {
+            self.draw_user_details(frame, &user, centered_rect(85, 75, root));
+        }
+        if self.details_disk.is_some() {
+            self.draw_disk_details(frame, centered_rect(74, 68, root));
+        }
         if let Some(pending) = self.pending_action.clone() {
             self.draw_confirmation(frame, &pending, centered_rect(62, 28, root));
         }
@@ -727,7 +1036,7 @@ impl AppState {
         let rows = self.visible_jobs();
         clamp_selection(&mut self.jobs_table, rows.len());
         let headers = [
-            "JOBID", "USER", "STATE", "PART", "NAME", "NODES", "CPUS", "GPUS", "MEM", "TIME",
+            "JOBID", "USER", "STATE", "PART", "NAME", "NODE", "CPU", "GPU", "MEM", "TIME",
         ];
         let sort_idx = job_column_to_index(self.jobs_sort);
         let direction = self.directions[PanelId::Jobs.index()];
@@ -752,17 +1061,10 @@ impl AppState {
         for (i, &is_visible) in visible.iter().enumerate() {
             if is_visible {
                 constraints.push(match headers[i] {
-                    "JOBID" => Constraint::Percentage(10),
-                    "USER" => Constraint::Percentage(10),
-                    "STATE" => Constraint::Percentage(10),
-                    "PART" => Constraint::Percentage(8),
-                    "NAME" => Constraint::Percentage(18),
-                    "NODES" => Constraint::Percentage(8),
-                    "CPUS" => Constraint::Percentage(6),
-                    "GPUS" => Constraint::Percentage(6),
-                    "MEM" => Constraint::Percentage(8),
-                    "TIME" => Constraint::Percentage(10),
-                    _ => Constraint::Percentage(10),
+                    "NAME" => Constraint::Percentage(20),
+                    "MEM" => Constraint::Percentage(10),
+                    "TIME" => Constraint::Percentage(14),
+                    _ => Constraint::Percentage(8),
                 });
             }
         }
@@ -790,7 +1092,7 @@ impl AppState {
         let rows = self.visible_nodes();
         clamp_selection(&mut self.nodes_table, rows.len());
         let headers = [
-            "NODE", "STATE", "CPU(T)", "CPU(F)", "MEM(T)", "MEM(F)", "GPU(T)", "GPU(F)"
+            "NODE", "STATE", "CPU(T)", "CPU(F)", "MEM(T)", "MEM(F)", "GPU(T)", "GPU(F)",
         ];
         let sort_idx = node_column_to_index(self.nodes_sort);
         let direction = self.directions[PanelId::Nodes.index()];
@@ -814,10 +1116,6 @@ impl AppState {
             if is_visible {
                 constraints.push(match headers[i] {
                     "NODE" => Constraint::Percentage(20),
-                    "STATE" => Constraint::Percentage(10),
-                    "CPU(T)" | "CPU(F)" => Constraint::Percentage(10),
-                    "MEM(T)" | "MEM(F)" => Constraint::Percentage(10),
-                    "GPU(T)" | "GPU(F)" => Constraint::Percentage(10),
                     _ => Constraint::Percentage(10),
                 });
             }
@@ -859,7 +1157,7 @@ impl AppState {
             ];
             Row::new(select_visible(values, &visible))
         });
-        let constraints = equal_widths(visible.len());
+        let constraints = equal_widths(visible.iter().filter(|is_visible| **is_visible).count());
         self.add_header_hits(area, PanelId::Gpus, &constraints);
         let title = self.panel_title(PanelId::Gpus, format!("rows={}", rows.len()));
         let header_cells = decorate_headers(&headers, sort_idx, direction, &visible);
@@ -874,27 +1172,18 @@ impl AppState {
         let Some(area) = self.panel_areas[PanelId::Disks.index()] else {
             return;
         };
-        let mut disks = self.snapshot.as_ref().map_or_else(Vec::new, |s| s.snapshot.disk_info.clone());
-        disks.sort_by(|a, b| {
-            let parse_size = |s: &str| -> f64 {
-                let num_str: String = s.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-                let num: f64 = num_str.parse().unwrap_or(0.0);
-                if s.ends_with('K') { num * 1024.0 }
-                else if s.ends_with('M') { num * 1024.0 * 1024.0 }
-                else if s.ends_with('G') { num * 1024.0 * 1024.0 * 1024.0 }
-                else if s.ends_with('T') { num * 1024.0 * 1024.0 * 1024.0 * 1024.0 }
-                else if s.ends_with('P') { num * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 }
-                else { num }
-            };
-            parse_size(&b.size).partial_cmp(&parse_size(&a.size)).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let disks = self.disk_rows();
         clamp_selection(&mut self.disks_table, disks.len());
         let mut table_rows: Vec<Row<'static>> = Vec::new();
         let bar_width = 12_usize;
+        let headers = ["USAGE", "PATH", "TYPE", "SPACE"];
+        let sort_idx = disk_column_to_index(self.disk_sort);
+        let direction = self.directions[PanelId::Disks.index()];
+        let visible = self.visible_columns(PanelId::Disks, headers.len());
         for disk in &disks {
             let filled = (usize::from(disk.use_percent) * bar_width) / 100;
             let empty = bar_width.saturating_sub(filled);
-            
+
             let color = match disk.label {
                 slmtop_core::DiskLabel::Ssd => Color::LightGreen,
                 slmtop_core::DiskLabel::Hdd => Color::LightYellow,
@@ -909,23 +1198,31 @@ impl AppState {
                 " ".repeat(empty),
                 disk.use_percent
             );
-            table_rows.push(Row::new(vec![
-                Cell::from(Line::from(Span::styled(bar_text, Style::default().fg(color)))),
+            let cells = [
+                Cell::from(Line::from(Span::styled(
+                    bar_text,
+                    Style::default().fg(color),
+                ))),
                 Cell::from(disk.mount.clone()),
                 Cell::from(disk.label.as_str()),
                 Cell::from(format!("{}/{}", disk.used, disk.size)),
-            ]));
+            ];
+            table_rows.push(Row::new(select_visible_cells(cells, &visible)));
         }
         let title = self.panel_title(PanelId::Disks, format!("disks={}", disks.len()));
-        let headers = ["USAGE", "PATH", "TYPE", "SPACE"];
-        let constraints = vec![
-            Constraint::Length(20),
-            Constraint::Percentage(40),
-            Constraint::Length(6),
-            Constraint::Percentage(40),
-        ];
+        let constraints = select_visible_constraints(
+            &[
+                Constraint::Length(20),
+                Constraint::Percentage(40),
+                Constraint::Length(6),
+                Constraint::Percentage(40),
+            ],
+            &visible,
+        );
+        self.add_header_hits(area, PanelId::Disks, &constraints);
+        let header_cells = decorate_headers(&headers, sort_idx, direction, &visible);
         let table = Table::new(table_rows, constraints)
-            .header(Row::new(headers.map(Cell::from)).style(self.theme.header_style))
+            .header(Row::new(header_cells).style(self.theme.header_style))
             .block(self.themed_panel_block(title, self.focus == PanelId::Disks))
             .row_highlight_style(self.theme.highlight);
         frame.render_stateful_widget(table, area, &mut self.disks_table);
@@ -935,54 +1232,15 @@ impl AppState {
         let Some(area) = self.panel_areas[PanelId::Summary.index()] else {
             return;
         };
-        let summary_rows = 3_usize;
-        clamp_selection(&mut self.summary_table, summary_rows);
         let headers = [
-            "", "R-JOBS", "R-CPUs", "R-GPUs", "│", "P-JOBS", "P-CPUs", "P-GPUs"
+            "", "R-JOB", "R-CPU", "R-GPU", "│", "P-JOB", "P-CPU", "P-GPU",
         ];
-        let mut table_rows: Vec<Row<'static>> = Vec::new();
-        if let Some(snapshot) = self.snapshot.as_ref() {
-            let summary = &snapshot.snapshot.job_summary;
-            table_rows.push(
-                Row::new(vec![
-                    Cell::from("All"),
-                    Cell::from(summary.all.running.jobs.to_string()),
-                    Cell::from(summary.all.running.cpus.to_string()),
-                    Cell::from(summary.all.running.gpus.to_string()),
-                    Cell::from("│"),
-                    Cell::from(summary.all.pending.jobs.to_string()),
-                    Cell::from(summary.all.pending.cpus.to_string()),
-                    Cell::from(summary.all.pending.gpus.to_string()),
-                ])
-                .style(self.theme.summary_all),
-            );
-            table_rows.push(
-                Row::new(vec![
-                    Cell::from("Me"),
-                    Cell::from(summary.me.running.jobs.to_string()),
-                    Cell::from(summary.me.running.cpus.to_string()),
-                    Cell::from(summary.me.running.gpus.to_string()),
-                    Cell::from("│"),
-                    Cell::from(summary.me.pending.jobs.to_string()),
-                    Cell::from(summary.me.pending.cpus.to_string()),
-                    Cell::from(summary.me.pending.gpus.to_string()),
-                ])
-                .style(self.theme.summary_me),
-            );
-            table_rows.push(
-                Row::new(vec![
-                    Cell::from("Others"),
-                    Cell::from(summary.others.running.jobs.to_string()),
-                    Cell::from(summary.others.running.cpus.to_string()),
-                    Cell::from(summary.others.running.gpus.to_string()),
-                    Cell::from("│"),
-                    Cell::from(summary.others.pending.jobs.to_string()),
-                    Cell::from(summary.others.pending.cpus.to_string()),
-                    Cell::from(summary.others.pending.gpus.to_string()),
-                ])
-                .style(self.theme.summary_others),
-            );
-        }
+        let rows = self.summary_display_rows();
+        let table_rows = rows
+            .iter()
+            .map(|row| summary_table_row(row, summary_row_style(self.theme, row.kind)))
+            .collect::<Vec<_>>();
+        clamp_selection(&mut self.summary_table, rows.len().max(1));
         let title = self.panel_title(PanelId::Summary, "job stats");
         let constraints = vec![
             Constraint::Length(8),
@@ -1015,7 +1273,10 @@ impl AppState {
             Span::styled(" slmtop ", self.theme.status_badge),
             Span::raw(format!(
                 " {mode} focus={} theme={} | Tab / s d f c x v [] t ? q | {}{}",
-                self.focus.title(), self.theme_name.label(), self.status, error
+                self.focus.title(),
+                self.theme_name.label(),
+                self.status,
+                error
             )),
         ]);
         frame.render_widget(
@@ -1034,6 +1295,7 @@ impl AppState {
             Line::from("c: toggle column, x: hide panel, v: show panel, [ ] { } resize."),
             Line::from("Enter on job: details (c cancel, h hold, u release, r requeue)."),
             Line::from("Enter on node: node specs popup."),
+            Line::from("Enter on disk: current-user usage cache; u/r refresh in popup."),
             Line::from("t: cycle theme, ? or Esc: close help, q: quit."),
         ];
         frame.render_widget(
@@ -1111,10 +1373,7 @@ impl AppState {
         frame.render_widget(Clear, area);
         let irreversible = matches!(pending.action, JobAction::Cancel | JobAction::Requeue);
         let mut lines = vec![
-            Line::from(Span::styled(
-                "⚠  WARNING",
-                self.theme.warning_border,
-            )),
+            Line::from(Span::styled("⚠  WARNING", self.theme.warning_border)),
             Line::from(""),
             Line::from(format!(
                 "Confirm {} for job {}?",
@@ -1134,10 +1393,7 @@ impl AppState {
             .title("⚠ Confirm Job Action")
             .borders(Borders::ALL)
             .border_style(self.theme.warning_border);
-        frame.render_widget(
-            Paragraph::new(lines).block(block),
-            area,
-        );
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
     fn handle_key<B>(
@@ -1169,6 +1425,21 @@ impl AppState {
                 KeyCode::Esc | KeyCode::Char('q') => self.details_node = None,
                 _ => {}
             }
+            return false;
+        }
+        if self.details_gpu.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.details_gpu = None,
+                _ => {}
+            }
+            return false;
+        }
+        if self.details_user.is_some() {
+            self.handle_user_details_key(key);
+            return false;
+        }
+        if self.details_disk.is_some() {
+            self.handle_disk_details_key(key, backend, tx);
             return false;
         }
         if self.details_job.is_some() {
@@ -1207,16 +1478,45 @@ impl AppState {
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Enter => {
-                if self.focus == PanelId::Jobs {
-                    self.details_job = self.selected_job().map(|job| job.id);
-                } else if self.focus == PanelId::Nodes {
-                    self.details_node = self.selected_node().map(|node| node.name);
-                }
-            }
+            KeyCode::Enter => self.open_focused_details(backend, tx),
             _ => {}
         }
         false
+    }
+
+    fn open_focused_details<B>(&mut self, backend: Arc<B>, tx: mpsc::Sender<UiMessage>)
+    where
+        B: SlurmClient + 'static,
+    {
+        match self.focus {
+            PanelId::Jobs => self.details_job = self.selected_job().map(|job| job.id),
+            PanelId::Nodes => self.details_node = self.selected_node().map(|node| node.name),
+            PanelId::Gpus => self.details_gpu = self.selected_gpu().map(|row| row.gpu_type),
+            PanelId::Summary => self.open_selected_summary_user(),
+            PanelId::Disks => {
+                if let Some(disk) = self.selected_disk() {
+                    self.open_disk_details(disk.mount, backend, tx);
+                }
+            }
+        }
+    }
+
+    fn open_selected_summary_user(&mut self) {
+        let Some(user) = self.selected_summary_user() else {
+            return;
+        };
+        if user == "All" || user == "Others" {
+            return;
+        }
+        let (running, pending) = self.user_detail_jobs(&user);
+        self.details_user = Some(user);
+        self.user_running_table.select(Some(0));
+        self.user_pending_table.select(Some(0));
+        self.user_details_section = if running.is_empty() && !pending.is_empty() {
+            UserJobSection::Pending
+        } else {
+            UserJobSection::Running
+        };
     }
 
     fn handle_details_key(&mut self, key: KeyEvent) -> bool {
@@ -1229,6 +1529,67 @@ impl AppState {
             _ => {}
         }
         false
+    }
+
+    fn handle_user_details_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.details_user = None,
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.user_details_section = self.user_details_section.toggled();
+            }
+            KeyCode::Char('s') => {
+                self.user_details_sort = next_user_job_column(self.user_details_sort);
+            }
+            KeyCode::Char('d') => {
+                self.user_details_direction = self.user_details_direction.toggled();
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_user_details_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_user_details_selection(-1),
+            KeyCode::PageDown => self.move_user_details_selection(10),
+            KeyCode::PageUp => self.move_user_details_selection(-10),
+            KeyCode::Home => self.set_user_details_selection(0),
+            KeyCode::End => {
+                if let Some(len) = self.active_user_details_len() {
+                    self.set_user_details_selection(len.saturating_sub(1));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_disk_details_key<B>(
+        &mut self,
+        key: KeyEvent,
+        backend: Arc<B>,
+        tx: mpsc::Sender<UiMessage>,
+    ) where
+        B: SlurmClient + 'static,
+    {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.details_disk = None,
+            KeyCode::Char('u' | 'r') => {
+                if let Some(key) = self.details_disk.as_ref().map(DiskDetails::key) {
+                    self.start_disk_usage_scan(key, backend, tx);
+                }
+            }
+            KeyCode::Char('s') => {
+                self.disk_usage_sort = next_disk_usage_column(self.disk_usage_sort);
+            }
+            KeyCode::Char('d') => {
+                self.disk_usage_direction = self.disk_usage_direction.toggled();
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_disk_usage_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_disk_usage_selection(-1),
+            KeyCode::PageDown => self.move_disk_usage_selection(10),
+            KeyCode::PageUp => self.move_disk_usage_selection(-10),
+            KeyCode::Home => self.disk_usage_table.select(Some(0)),
+            KeyCode::End => {
+                if let Some(len) = self.active_disk_usage_len() {
+                    self.disk_usage_table.select(Some(len.saturating_sub(1)));
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_confirmation_key<B>(
@@ -1284,6 +1645,9 @@ impl AppState {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.handle_modal_mouse(mouse) {
+            return;
+        }
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
@@ -1306,6 +1670,88 @@ impl AppState {
                     return;
                 }
             }
+        }
+    }
+
+    fn handle_modal_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.details_user.is_some() {
+            self.handle_user_details_mouse(mouse);
+            return true;
+        }
+        if self.details_disk.is_some() {
+            self.handle_disk_details_mouse(mouse);
+            return true;
+        }
+        self.pending_action.is_some()
+            || self.show_help
+            || self.mode != InputMode::Normal
+            || self.details_job.is_some()
+            || self.details_node.is_some()
+            || self.details_gpu.is_some()
+    }
+
+    fn handle_user_details_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(hit) = self
+                    .modal_header_hits
+                    .iter()
+                    .find(|hit| hit.contains(mouse.column, mouse.row))
+                    .copied()
+                {
+                    if let Some(section) = hit.table.user_section() {
+                        self.user_details_section = section;
+                        self.set_user_details_sort(user_job_column_from_index(hit.column));
+                    }
+                    return;
+                }
+                if let Some(hit) = self.modal_table_at(mouse.column, mouse.row) {
+                    if let Some(section) = hit.table.user_section() {
+                        self.user_details_section = section;
+                        if let Some(row) = table_body_row_at(hit.area, mouse.column, mouse.row) {
+                            self.select_visible_user_details_row(section, row);
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                self.set_user_details_section_under_mouse(mouse.column, mouse.row);
+                self.move_user_details_selection(-3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.set_user_details_section_under_mouse(mouse.column, mouse.row);
+                self.move_user_details_selection(3);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_disk_details_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(hit) = self
+                    .modal_header_hits
+                    .iter()
+                    .find(|hit| hit.contains(mouse.column, mouse.row))
+                    .copied()
+                {
+                    if hit.table == ModalTable::DiskUsage {
+                        self.set_disk_usage_sort(disk_usage_column_from_index(hit.column));
+                    }
+                    return;
+                }
+                if let Some(hit) = self.modal_table_at(mouse.column, mouse.row) {
+                    if hit.table == ModalTable::DiskUsage {
+                        if let Some(row) = table_body_row_at(hit.area, mouse.column, mouse.row) {
+                            let selected = self.disk_usage_table.offset().saturating_add(row);
+                            self.disk_usage_table.select(Some(selected));
+                        }
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => self.move_disk_usage_selection(-3),
+            MouseEventKind::ScrollDown => self.move_disk_usage_selection(3),
+            _ => {}
         }
     }
 
@@ -1366,6 +1812,86 @@ impl AppState {
             }
         });
         rows
+    }
+
+    fn disk_rows(&self) -> Vec<DiskInfo> {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = snapshot.snapshot.disk_info.clone();
+        let direction = self.directions[PanelId::Disks.index()];
+        rows.sort_by(|a, b| {
+            let ordering = match self.disk_sort {
+                DiskColumn::Usage => a.use_percent.cmp(&b.use_percent),
+                DiskColumn::Path => a.mount.to_lowercase().cmp(&b.mount.to_lowercase()),
+                DiskColumn::Type => a.label.as_str().cmp(b.label.as_str()),
+                DiskColumn::Space => disk_size_bytes(&a.size).cmp(&disk_size_bytes(&b.size)),
+            }
+            .then_with(|| a.mount.cmp(&b.mount));
+            match direction {
+                SortDirection::Asc => ordering,
+                SortDirection::Desc => ordering.reverse(),
+            }
+        });
+        rows
+    }
+
+    fn user_detail_jobs(&self, user: &str) -> (Vec<Job>, Vec<Job>) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut running = Vec::new();
+        let mut pending = Vec::new();
+        for job in &snapshot.snapshot.jobs {
+            if !job.user.eq_ignore_ascii_case(user) {
+                continue;
+            }
+            let state = job.state.to_ascii_uppercase();
+            if state.starts_with('R') {
+                running.push(job.clone());
+            } else if state.starts_with('P') {
+                pending.push(job.clone());
+            }
+        }
+        (
+            sort_user_jobs(running, self.user_details_sort, self.user_details_direction),
+            sort_user_jobs(pending, self.user_details_sort, self.user_details_direction),
+        )
+    }
+
+    fn sorted_disk_usage_rows(&self) -> Vec<DiskUserUsage> {
+        let mut rows = self.active_disk_usage_view().rows;
+        rows.sort_by(|a, b| {
+            let ordering = match self.disk_usage_sort {
+                DiskUsageColumn::User => a.user.to_lowercase().cmp(&b.user.to_lowercase()),
+                DiskUsageColumn::Used => a.bytes.cmp(&b.bytes),
+                DiskUsageColumn::Entries => a.entries.cmp(&b.entries),
+            }
+            .then_with(|| a.user.cmp(&b.user));
+            match self.disk_usage_direction {
+                SortDirection::Asc => ordering,
+                SortDirection::Desc => ordering.reverse(),
+            }
+        });
+        rows
+    }
+
+    fn active_disk_usage_view(&self) -> DiskUsageView {
+        let Some(key) = self.details_disk.as_ref().map(DiskDetails::key) else {
+            return DiskUsageView {
+                rows: Vec::new(),
+                captured_at: None,
+                scan_started_at: None,
+                error: None,
+            };
+        };
+        let cache = self.disk_usage_cache.get(&key);
+        DiskUsageView {
+            rows: cache.map_or_else(Vec::new, |cache| cache.rows.clone()),
+            captured_at: cache.map(|cache| cache.captured_at),
+            scan_started_at: self.disk_usage_scans.get(&key).map(|scan| scan.started_at),
+            error: self.disk_usage_errors.get(&key).cloned(),
+        }
     }
 
     fn selected_job(&self) -> Option<Job> {
@@ -1475,6 +2001,63 @@ impl AppState {
         }
     }
 
+    fn move_user_details_selection(&mut self, delta: isize) {
+        let Some(len) = self.active_user_details_len() else {
+            return;
+        };
+        let table = self.active_user_details_table_mut();
+        move_table_selection(table, len, delta);
+    }
+
+    fn set_user_details_selection(&mut self, row: usize) {
+        let Some(len) = self.active_user_details_len() else {
+            return;
+        };
+        if len == 0 {
+            self.active_user_details_table_mut().select(None);
+        } else {
+            self.active_user_details_table_mut()
+                .select(Some(row.min(len - 1)));
+        }
+    }
+
+    fn select_visible_user_details_row(&mut self, section: UserJobSection, visible_row: usize) {
+        let table = self.user_details_table_mut(section);
+        let selected = table.offset().saturating_add(visible_row);
+        table.select(Some(selected));
+    }
+
+    fn active_user_details_len(&self) -> Option<usize> {
+        let user = self.details_user.as_ref()?;
+        let (running, pending) = self.user_detail_jobs(user);
+        Some(match self.user_details_section {
+            UserJobSection::Running => running.len(),
+            UserJobSection::Pending => pending.len(),
+        })
+    }
+
+    fn active_user_details_table_mut(&mut self) -> &mut TableState {
+        self.user_details_table_mut(self.user_details_section)
+    }
+
+    fn user_details_table_mut(&mut self, section: UserJobSection) -> &mut TableState {
+        match section {
+            UserJobSection::Running => &mut self.user_running_table,
+            UserJobSection::Pending => &mut self.user_pending_table,
+        }
+    }
+
+    fn move_disk_usage_selection(&mut self, delta: isize) {
+        let len = self.active_disk_usage_len().unwrap_or(0);
+        move_table_selection(&mut self.disk_usage_table, len, delta);
+    }
+
+    fn active_disk_usage_len(&self) -> Option<usize> {
+        self.details_disk
+            .as_ref()
+            .map(|_| self.active_disk_usage_view().rows.len())
+    }
+
     fn focused_table_mut(&mut self) -> &mut TableState {
         match self.focus {
             PanelId::Jobs => &mut self.jobs_table,
@@ -1500,7 +2083,7 @@ impl AppState {
             PanelId::Nodes => self.nodes_sort = next_node_column(self.nodes_sort),
             PanelId::Gpus => self.gpu_sort = next_gpu_column(self.gpu_sort),
             PanelId::Summary => self.accounting_sort = next_accounting_column(self.accounting_sort),
-            PanelId::Disks => {} // Sorting not implemented for disks
+            PanelId::Disks => self.disk_sort = next_disk_column(self.disk_sort),
         }
     }
 
@@ -1511,9 +2094,42 @@ impl AppState {
             PanelId::Nodes => self.nodes_sort = node_column_from_index(actual),
             PanelId::Gpus => self.gpu_sort = gpu_column_from_index(actual),
             PanelId::Summary => self.accounting_sort = accounting_column_from_index(actual),
-            PanelId::Disks => {} // Sorting not implemented for disks
+            PanelId::Disks => self.disk_sort = disk_column_from_index(actual),
         }
         self.toggle_direction();
+    }
+
+    fn set_user_details_sort(&mut self, column: UserJobColumn) {
+        if self.user_details_sort == column {
+            self.user_details_direction = self.user_details_direction.toggled();
+        } else {
+            self.user_details_sort = column;
+            self.user_details_direction = default_user_job_direction(column);
+        }
+    }
+
+    fn set_disk_usage_sort(&mut self, column: DiskUsageColumn) {
+        if self.disk_usage_sort == column {
+            self.disk_usage_direction = self.disk_usage_direction.toggled();
+        } else {
+            self.disk_usage_sort = column;
+            self.disk_usage_direction = default_disk_usage_direction(column);
+        }
+    }
+
+    fn set_user_details_section_under_mouse(&mut self, x: u16, y: u16) {
+        if let Some(hit) = self.modal_table_at(x, y) {
+            if let Some(section) = hit.table.user_section() {
+                self.user_details_section = section;
+            }
+        }
+    }
+
+    fn modal_table_at(&self, x: u16, y: u16) -> Option<ModalTableHit> {
+        self.modal_table_hits
+            .iter()
+            .find(|hit| contains(hit.area, x, y))
+            .copied()
     }
 
     fn actual_column(&self, panel: PanelId, visible_column: usize) -> usize {
@@ -1553,10 +2169,37 @@ impl AppState {
             .constraints(constraints)
             .spacing(1)
             .split(table_area);
-        
+
         for (idx, col_area) in columns.iter().enumerate() {
             self.header_hits.push(HeaderHit {
                 panel,
+                column: idx,
+                x_start: col_area.x,
+                x_end: col_area.x + col_area.width + 1,
+                y: table_area.y,
+            });
+        }
+    }
+
+    fn add_modal_header_hits(&mut self, area: Rect, table: ModalTable, constraints: &[Constraint]) {
+        if constraints.is_empty() || area.width <= 2 || area.height <= 2 {
+            return;
+        }
+        let table_area = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .spacing(1)
+            .split(table_area);
+
+        for (idx, col_area) in columns.iter().enumerate() {
+            self.modal_header_hits.push(ModalHeaderHit {
+                table,
                 column: idx,
                 x_start: col_area.x,
                 x_end: col_area.x + col_area.width + 1,
@@ -1573,6 +2216,157 @@ impl AppState {
     fn selected_node(&self) -> Option<Node> {
         let selected = self.nodes_table.selected()?;
         self.visible_nodes().get(selected).cloned()
+    }
+
+    fn selected_gpu(&self) -> Option<GpuRow> {
+        let selected = self.gpus_table.selected()?;
+        self.gpu_rows().get(selected).cloned()
+    }
+
+    fn selected_disk(&self) -> Option<DiskInfo> {
+        let selected = self.disks_table.selected()?;
+        self.disk_rows().get(selected).cloned()
+    }
+
+    fn open_disk_details<B>(&mut self, mount: String, backend: Arc<B>, tx: mpsc::Sender<UiMessage>)
+    where
+        B: SlurmClient + 'static,
+    {
+        let user = self.current_user.trim().to_string();
+        if user.is_empty() {
+            let key = DiskUsageKey {
+                mount: mount.clone(),
+                user,
+            };
+            self.disk_usage_errors.insert(
+                key.clone(),
+                DiskUsageError {
+                    message: "Current user is unknown; pass --user or set USER.".to_string(),
+                    occurred_at: SystemTime::now(),
+                },
+            );
+            self.details_disk = Some(DiskDetails {
+                mount: key.mount,
+                user: key.user,
+            });
+            return;
+        }
+        let key = DiskUsageKey {
+            mount: mount.clone(),
+            user: user.clone(),
+        };
+        self.details_disk = Some(DiskDetails { mount, user });
+        self.disk_usage_table.select(Some(0));
+        if !self.disk_usage_cache.contains_key(&key) && !self.disk_usage_scans.contains_key(&key) {
+            self.start_disk_usage_scan(key, backend, tx);
+        } else if let Some(cache) = self.disk_usage_cache.get(&key) {
+            self.status = format!(
+                "Loaded cached disk usage for {} on {} from {}",
+                key.user,
+                key.mount,
+                format_timestamp(cache.captured_at)
+            );
+        }
+    }
+
+    fn start_disk_usage_scan<B>(
+        &mut self,
+        key: DiskUsageKey,
+        backend: Arc<B>,
+        tx: mpsc::Sender<UiMessage>,
+    ) where
+        B: SlurmClient + 'static,
+    {
+        if self.disk_usage_scans.contains_key(&key) {
+            self.status = format!(
+                "Disk usage scan already running for {} on {}",
+                key.user, key.mount
+            );
+            return;
+        }
+        self.disk_usage_errors.remove(&key);
+        self.disk_usage_scans.insert(
+            key.clone(),
+            DiskUsageScan {
+                started_at: Instant::now(),
+            },
+        );
+        self.status = format!(
+            "Scanning disk usage for {} on {} ({})",
+            key.user,
+            key.mount,
+            disk_usage_timeout_label(self.disk_usage_timeout)
+        );
+        spawn_disk_usage(backend, key.mount, key.user, self.disk_usage_timeout, tx);
+    }
+
+    fn summary_display_rows(&self) -> Vec<SummaryDisplayRow> {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Vec::new();
+        };
+        let summary = &snapshot.snapshot.job_summary;
+        let mut rows = vec![
+            SummaryDisplayRow {
+                label: "All".to_string(),
+                summary: summary.all.clone(),
+                kind: SummaryRowKind::All,
+            },
+            SummaryDisplayRow {
+                label: "Me".to_string(),
+                summary: summary.me.clone(),
+                kind: SummaryRowKind::Me,
+            },
+        ];
+
+        let mut users = summary
+            .users
+            .iter()
+            .filter(|(user, _)| user.as_str() != self.current_user.as_str())
+            .collect::<Vec<_>>();
+        users.sort_by(|a, b| {
+            summary_total_jobs(b.1)
+                .cmp(&summary_total_jobs(a.1))
+                .then_with(|| a.0.cmp(b.0))
+        });
+
+        rows.extend(
+            users
+                .iter()
+                .take(10)
+                .map(|(user, stats)| SummaryDisplayRow {
+                    label: (*user).clone(),
+                    summary: (*stats).clone(),
+                    kind: SummaryRowKind::User,
+                }),
+        );
+
+        let overflow =
+            users
+                .iter()
+                .skip(10)
+                .fold(OwnerSummary::default(), |mut total, (_, stats)| {
+                    merge_owner_summary(&mut total, stats);
+                    total
+                });
+        if users.len() > 10 || summary_total_jobs(&overflow) > 0 {
+            rows.push(SummaryDisplayRow {
+                label: "Others".to_string(),
+                summary: overflow,
+                kind: SummaryRowKind::Others,
+            });
+        }
+        rows
+    }
+
+    fn selected_summary_user(&self) -> Option<String> {
+        let selected = self.summary_table.selected()?;
+        let row = self.summary_display_rows().get(selected)?.clone();
+        match row.kind {
+            SummaryRowKind::All => Some("All".to_string()),
+            SummaryRowKind::Me => Some(self.current_user.clone()),
+            SummaryRowKind::User => Some(row.label),
+            SummaryRowKind::Others => Some("Others".to_string()),
+        }
     }
 
     fn find_node(&self, name: &str) -> Option<Node> {
@@ -1627,9 +2421,235 @@ impl AppState {
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: true })
-                .block(self.themed_panel_block("Node Details".to_string(), true)),
+                .block(self.themed_panel_block(format!("Node Details: {node_name}"), true)),
             area,
         );
+    }
+
+    fn draw_gpu_details(&self, frame: &mut Frame<'_>, gpu_type: &str, area: Rect) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return;
+        };
+        frame.render_widget(Clear, area);
+
+        let mut lines = vec![
+            Line::from(format!("GPU Type  : {gpu_type}")),
+            Line::from(""),
+            Line::from("Node Distribution:"),
+            Line::from(format!("{:<15} | {:<5} | {:<5}", "Node", "Total", "Free")),
+            Line::from("-".repeat(31)),
+        ];
+
+        let mut matched_nodes = Vec::new();
+        for node in &snapshot.snapshot.nodes {
+            if let Some(&total) = node.gpus.get(gpu_type) {
+                let allocated = node.gpus_allocated.get(gpu_type).copied().unwrap_or(0);
+                let free = total.saturating_sub(allocated);
+                matched_nodes.push((node.name.clone(), total, free));
+            }
+        }
+
+        matched_nodes.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (node_name, total, free) in matched_nodes {
+            lines.push(Line::from(format!(
+                "{node_name:<15} | {total:<5} | {free:<5}"
+            )));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from("Esc close"));
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: true })
+                .block(self.themed_panel_block(format!("GPU Details: {gpu_type}"), true)),
+            area,
+        );
+    }
+
+    fn draw_user_details(&mut self, frame: &mut Frame<'_>, user: &str, area: Rect) {
+        frame.render_widget(Clear, area);
+        let (running, pending) = self.user_detail_jobs(user);
+        clamp_selection(&mut self.user_running_table, running.len());
+        clamp_selection(&mut self.user_pending_table, pending.len());
+
+        let block = self.themed_panel_block(
+            format!(
+                "User: {} | R:{} P:{} | Tab table | s/d sort | Esc close",
+                user,
+                running.len(),
+                pending.len()
+            ),
+            true,
+        );
+        frame.render_widget(block.clone(), area);
+        let inner = block.inner(area);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(inner);
+
+        let headers = [
+            "JOBID", "NAME", "NODE", "CPU", "GPU", "MEM", "TIME", "LIMIT",
+        ];
+        let constraints = vec![
+            Constraint::Percentage(10),
+            Constraint::Percentage(18),
+            Constraint::Percentage(12),
+            Constraint::Percentage(6),
+            Constraint::Percentage(18),
+            Constraint::Percentage(8),
+            Constraint::Percentage(14),
+            Constraint::Percentage(14),
+        ];
+        let header_cells = decorate_headers(
+            &headers,
+            user_job_column_to_index(self.user_details_sort),
+            self.user_details_direction,
+            &[true; 8],
+        );
+        let header_style = self.theme.header_style;
+        let highlight = self.theme.highlight;
+        let running_border = if self.user_details_section == UserJobSection::Running {
+            self.theme.border_focused
+        } else {
+            self.theme.border_unfocused
+        };
+        let pending_border = if self.user_details_section == UserJobSection::Pending {
+            self.theme.border_focused
+        } else {
+            self.theme.border_unfocused
+        };
+
+        let running_title = format!("Running ({})", running.len());
+        self.modal_table_hits.push(ModalTableHit {
+            table: ModalTable::UserRunning,
+            area: chunks[0],
+        });
+        self.add_modal_header_hits(chunks[0], ModalTable::UserRunning, &constraints);
+        let running_table = Table::new(user_job_rows(&running), constraints.clone())
+            .header(Row::new(header_cells.clone()).style(header_style))
+            .block(
+                Block::default()
+                    .title(running_title)
+                    .borders(Borders::ALL)
+                    .border_style(running_border),
+            )
+            .row_highlight_style(highlight);
+        frame.render_stateful_widget(running_table, chunks[0], &mut self.user_running_table);
+
+        let pending_title = format!("Pending ({})", pending.len());
+        self.modal_table_hits.push(ModalTableHit {
+            table: ModalTable::UserPending,
+            area: chunks[1],
+        });
+        self.add_modal_header_hits(chunks[1], ModalTable::UserPending, &constraints);
+        let pending_table = Table::new(user_job_rows(&pending), constraints)
+            .header(Row::new(header_cells).style(header_style))
+            .block(
+                Block::default()
+                    .title(pending_title)
+                    .borders(Borders::ALL)
+                    .border_style(pending_border),
+            )
+            .row_highlight_style(highlight);
+        frame.render_stateful_widget(pending_table, chunks[1], &mut self.user_pending_table);
+    }
+
+    fn draw_disk_details(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(details) = self.details_disk.clone() else {
+            return;
+        };
+        frame.render_widget(Clear, area);
+        let view = self.active_disk_usage_view();
+        let rows = self.sorted_disk_usage_rows();
+        clamp_selection(&mut self.disk_usage_table, rows.len());
+
+        let status = self.disk_usage_status(&view);
+        let block = self.themed_panel_block(
+            format!(
+                "Disk Usage: {} | user={} | rows={} | {status} | u update | Esc close",
+                details.mount,
+                details.user,
+                rows.len()
+            ),
+            true,
+        );
+        frame.render_widget(block.clone(), area);
+        let inner = block.inner(area);
+
+        if let Some(error) = view.error.as_ref().filter(|_| rows.is_empty()) {
+            draw_disk_usage_message(frame, inner, disk_usage_error_lines(error));
+            return;
+        }
+
+        if view.is_loading() && rows.is_empty() {
+            draw_disk_usage_message(
+                frame,
+                inner,
+                disk_usage_loading_lines(self.disk_usage_timeout),
+            );
+            return;
+        }
+
+        if rows.is_empty() {
+            draw_disk_usage_message(frame, inner, disk_usage_empty_lines(&details.user));
+            return;
+        }
+
+        let headers = ["USER", "USED", "ENTRIES"];
+        let constraints = vec![
+            Constraint::Percentage(45),
+            Constraint::Percentage(25),
+            Constraint::Percentage(30),
+        ];
+        self.modal_table_hits.push(ModalTableHit {
+            table: ModalTable::DiskUsage,
+            area: inner,
+        });
+        self.add_modal_header_hits(inner, ModalTable::DiskUsage, &constraints);
+        let header_cells = decorate_headers(
+            &headers,
+            disk_usage_column_to_index(self.disk_usage_sort),
+            self.disk_usage_direction,
+            &[true; 3],
+        );
+        let table = Table::new(disk_usage_rows(&rows), constraints)
+            .header(Row::new(header_cells).style(self.theme.header_style))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(self.theme.border_focused),
+            )
+            .row_highlight_style(self.theme.highlight);
+        frame.render_stateful_widget(table, inner, &mut self.disk_usage_table);
+    }
+
+    fn disk_usage_status(&self, view: &DiskUsageView) -> String {
+        if let Some(started_at) = view.scan_started_at {
+            let elapsed = started_at.elapsed().as_secs();
+            return match self.disk_usage_timeout {
+                Some(limit) => format!(
+                    "{} scanning {}s/{}s",
+                    spinner(started_at),
+                    elapsed,
+                    limit.as_secs()
+                ),
+                None => format!("{} scanning {}s/no timeout", spinner(started_at), elapsed),
+            };
+        }
+        if view.error.is_some() && view.captured_at.is_some() {
+            return "cached; update failed".to_string();
+        }
+        if view.error.is_some() {
+            return "error".to_string();
+        }
+        view.captured_at.map_or_else(
+            || "not scanned".to_string(),
+            |captured_at| format!("cached {}", format_timestamp(captured_at)),
+        )
     }
 
     fn themed_panel_block(&self, title: String, focused: bool) -> Block<'static> {
@@ -1660,6 +2680,59 @@ impl HeaderHit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModalTable {
+    UserRunning,
+    UserPending,
+    DiskUsage,
+}
+
+impl ModalTable {
+    const fn user_section(self) -> Option<UserJobSection> {
+        match self {
+            Self::UserRunning => Some(UserJobSection::Running),
+            Self::UserPending => Some(UserJobSection::Pending),
+            Self::DiskUsage => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModalHeaderHit {
+    table: ModalTable,
+    column: usize,
+    x_start: u16,
+    x_end: u16,
+    y: u16,
+}
+
+impl ModalHeaderHit {
+    const fn contains(self, x: u16, y: u16) -> bool {
+        y == self.y && x >= self.x_start && x < self.x_end
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ModalTableHit {
+    table: ModalTable,
+    area: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SummaryRowKind {
+    All,
+    Me,
+    User,
+    Others,
+}
+
+#[derive(Debug, Clone)]
+struct SummaryDisplayRow {
+    label: String,
+    summary: OwnerSummary,
+    kind: SummaryRowKind,
+}
+
 #[derive(Debug, Clone)]
 struct GpuRow {
     gpu_type: String,
@@ -1685,6 +2758,287 @@ fn gpu_rows_from_summary(summary: &GpuSummary) -> Vec<GpuRow> {
         free: stats.free_estimate,
     }));
     rows
+}
+
+fn sort_user_jobs(jobs: Vec<Job>, column: UserJobColumn, direction: SortDirection) -> Vec<Job> {
+    match column {
+        UserJobColumn::JobId => sort_jobs(jobs, JobColumn::JobId, direction),
+        UserJobColumn::Name => sort_jobs(jobs, JobColumn::Name, direction),
+        UserJobColumn::Node => sort_jobs(jobs, JobColumn::Nodes, direction),
+        UserJobColumn::Cpus => sort_jobs(jobs, JobColumn::Cpus, direction),
+        UserJobColumn::Gpus => sort_jobs(jobs, JobColumn::Gpus, direction),
+        UserJobColumn::Memory => sort_jobs(jobs, JobColumn::Memory, direction),
+        UserJobColumn::Time => sort_jobs(jobs, JobColumn::Time, direction),
+        UserJobColumn::Limit => sort_user_jobs_by_limit(jobs, direction),
+    }
+}
+
+fn sort_user_jobs_by_limit(mut jobs: Vec<Job>, direction: SortDirection) -> Vec<Job> {
+    jobs.sort_by(|a, b| {
+        let ordering = parse_slurm_time(&a.time_limit)
+            .cmp(&parse_slurm_time(&b.time_limit))
+            .then_with(|| a.id_sort_key().cmp(&b.id_sort_key()));
+        match direction {
+            SortDirection::Asc => ordering,
+            SortDirection::Desc => ordering.reverse(),
+        }
+    });
+    jobs
+}
+
+fn user_job_rows(jobs: &[Job]) -> Vec<Row<'static>> {
+    jobs.iter()
+        .map(|job| {
+            let gpu_str = gpu_map_display(job);
+            let node_display = if job.node_list.is_empty() {
+                job.nodes.clone()
+            } else {
+                job.node_list.clone()
+            };
+            Row::new(vec![
+                Cell::from(job.id.clone()),
+                Cell::from(truncate_text(&job.name, 18)),
+                Cell::from(node_display),
+                Cell::from(job.cpus.to_string()),
+                Cell::from(gpu_str),
+                Cell::from(job.memory.to_string()),
+                Cell::from(job.time_used.clone()),
+                Cell::from(job.time_limit.clone()),
+            ])
+        })
+        .collect()
+}
+
+fn disk_usage_rows(rows: &[DiskUserUsage]) -> Vec<Row<'static>> {
+    rows.iter()
+        .map(|row| {
+            let entries = if row.entries == 0 {
+                "-".to_string()
+            } else {
+                row.entries.to_string()
+            };
+            Row::new(vec![
+                Cell::from(row.user.clone()),
+                Cell::from(row.human_bytes()),
+                Cell::from(entries),
+            ])
+        })
+        .collect()
+}
+
+fn disk_usage_error_lines(error: &DiskUsageError) -> Vec<Line<'static>> {
+    vec![
+        Line::from("Per-user usage scan failed."),
+        Line::from(error.message.clone()),
+        Line::from(format!("Failed at {}", format_timestamp(error.occurred_at))),
+        Line::from(""),
+        Line::from(
+            "Press u to retry; start with --disk-usage-no-timeout for unlimited background scans.",
+        ),
+        Line::from("Esc close"),
+    ]
+}
+
+fn disk_usage_loading_lines(timeout: Option<Duration>) -> Vec<Line<'static>> {
+    vec![
+        Line::from("Scanning visible files owned by the current user..."),
+        Line::from("Using quota/user-directory shortcuts first, then a streaming background scan."),
+        Line::from("No command line is shown here; this work runs in the background."),
+        Line::from(format!(
+            "Timeout mode: {}",
+            disk_usage_timeout_label(timeout)
+        )),
+    ]
+}
+
+fn disk_usage_empty_lines(user: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(format!(
+            "No files owned by {user} were found on this mount."
+        )),
+        Line::from("The scan only includes directories the current process can traverse."),
+    ]
+}
+
+fn draw_disk_usage_message(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'static>>) {
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+}
+
+fn spinner(started_at: Instant) -> &'static str {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    let frame = (started_at.elapsed().as_millis() / 200) as usize % FRAMES.len();
+    FRAMES[frame]
+}
+
+fn disk_usage_timeout_label(timeout: Option<Duration>) -> String {
+    timeout.map_or_else(
+        || "no timeout".to_string(),
+        |timeout| format!("{}s", timeout.as_secs()),
+    )
+}
+
+fn load_disk_usage_cache() -> HashMap<DiskUsageKey, DiskUsageCacheEntry> {
+    let Some(path) = disk_usage_cache_path() else {
+        return HashMap::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(cache_file) = serde_json::from_str::<DiskUsageCacheFile>(&text) else {
+        return HashMap::new();
+    };
+    if cache_file.version != 1 {
+        return HashMap::new();
+    }
+    cache_file
+        .entries
+        .into_iter()
+        .map(|entry| (entry.key, entry.value))
+        .collect()
+}
+
+fn persist_disk_usage_cache(cache: &HashMap<DiskUsageKey, DiskUsageCacheEntry>) {
+    let Some(path) = disk_usage_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let cache_file = DiskUsageCacheFile {
+        version: 1,
+        entries: cache
+            .iter()
+            .map(|(key, value)| DiskUsageCacheFileEntry {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&cache_file) {
+        let _ = fs::write(path, json);
+    }
+}
+
+fn disk_usage_cache_path() -> Option<PathBuf> {
+    if let Ok(cache_home) = env::var("XDG_CACHE_HOME") {
+        if !cache_home.is_empty() {
+            return Some(
+                PathBuf::from(cache_home)
+                    .join("slmtop")
+                    .join("disk_usage.json"),
+            );
+        }
+    }
+    env::var("HOME")
+        .ok()
+        .filter(|home| !home.is_empty())
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".cache")
+                .join("slmtop")
+                .join("disk_usage.json")
+        })
+}
+
+fn friendly_disk_usage_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return "Usage scan timed out. This filesystem is too large to scan directly, and no quick user-directory result was available. Restart with --disk-usage-no-timeout to let scans run until completion.".to_string();
+    }
+    if lower.contains("find ") || lower.contains(" du ") || lower.contains("backend command") {
+        return "Usage scan failed in the background. Command details are hidden; try a narrower user/project directory or a filesystem quota tool.".to_string();
+    }
+    error.to_string()
+}
+
+fn format_timestamp(time: SystemTime) -> String {
+    let Ok(duration) = time.duration_since(UNIX_EPOCH) else {
+        return "before 1970-01-01 00:00 UTC".to_string();
+    };
+    let total_seconds = duration.as_secs();
+    let days = i64::try_from(total_seconds / 86_400).unwrap_or(i64::MAX);
+    let seconds_of_day = total_seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let days = days_since_epoch + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = i32::try_from(year_of_era + era * 400).unwrap_or(i32::MAX);
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (
+        year,
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
+    )
+}
+
+fn summary_table_row(row: &SummaryDisplayRow, style: Style) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(row.label.clone()),
+        Cell::from(row.summary.running.jobs.to_string()),
+        Cell::from(row.summary.running.cpus.to_string()),
+        Cell::from(row.summary.running.gpus.to_string()),
+        Cell::from("│"),
+        Cell::from(row.summary.pending.jobs.to_string()),
+        Cell::from(row.summary.pending.cpus.to_string()),
+        Cell::from(row.summary.pending.gpus.to_string()),
+    ])
+    .style(style)
+}
+
+fn summary_row_style(theme: Theme, kind: SummaryRowKind) -> Style {
+    match kind {
+        SummaryRowKind::All => theme.summary_all,
+        SummaryRowKind::Me => theme.summary_me,
+        SummaryRowKind::User | SummaryRowKind::Others => theme.summary_others,
+    }
+}
+
+fn summary_total_jobs(summary: &OwnerSummary) -> u64 {
+    summary.running.jobs + summary.pending.jobs
+}
+
+fn merge_owner_summary(total: &mut OwnerSummary, stats: &OwnerSummary) {
+    total.running.jobs += stats.running.jobs;
+    total.running.cpus += stats.running.cpus;
+    total.running.gpus += stats.running.gpus;
+    total.running.memory.0 += stats.running.memory.0;
+    total.pending.jobs += stats.pending.jobs;
+    total.pending.cpus += stats.pending.cpus;
+    total.pending.gpus += stats.pending.gpus;
+    total.pending.memory.0 += stats.pending.memory.0;
+}
+
+fn gpu_map_display(job: &Job) -> String {
+    if job.gpus.is_empty() {
+        return "0".to_string();
+    }
+    job.gpus
+        .iter()
+        .map(|(gpu_type, count)| format!("{gpu_type}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let truncated: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{truncated}\u{2026}")
 }
 
 fn compute_panel_areas(
@@ -1735,8 +3089,9 @@ fn compute_panel_areas(
 
     let top_empty =
         areas[PanelId::Jobs.index()].is_none() && areas[PanelId::Nodes.index()].is_none();
-    let bottom_empty =
-        areas[PanelId::Gpus.index()].is_none() && areas[PanelId::Summary.index()].is_none() && areas[PanelId::Disks.index()].is_none();
+    let bottom_empty = areas[PanelId::Gpus.index()].is_none()
+        && areas[PanelId::Summary.index()].is_none()
+        && areas[PanelId::Disks.index()].is_none();
     if top_empty || bottom_empty {
         areas.fill(None);
         place_row(
@@ -1844,7 +3199,7 @@ fn decorate_headers<const N: usize>(
             if idx == sort_column {
                 Cell::from(format!("{header}{}", sort_indicator(direction)))
             } else {
-                Cell::from(header.to_string())
+                Cell::from((*header).to_string())
             }
         })
         .collect()
@@ -1905,6 +3260,27 @@ fn select_visible<T: ToString, const N: usize>(
         .collect()
 }
 
+fn select_visible_cells<const N: usize>(
+    values: [Cell<'static>; N],
+    visible: &[bool],
+) -> Vec<Cell<'static>> {
+    values
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| *visible.get(*idx).unwrap_or(&true))
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn select_visible_constraints(values: &[Constraint], visible: &[bool]) -> Vec<Constraint> {
+    values
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *visible.get(*idx).unwrap_or(&true))
+        .map(|(_, value)| *value)
+        .collect()
+}
+
 fn clamp_selection(state: &mut TableState, len: usize) {
     if len == 0 {
         state.select(None);
@@ -1912,6 +3288,76 @@ fn clamp_selection(state: &mut TableState, len: usize) {
     }
     let idx = state.selected().unwrap_or(0).min(len - 1);
     state.select(Some(idx));
+}
+
+fn move_table_selection(state: &mut TableState, len: usize, delta: isize) {
+    if len == 0 {
+        state.select(None);
+        return;
+    }
+    let current = state.selected().unwrap_or(0).min(len - 1);
+    let next = if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current
+            .saturating_add(delta.unsigned_abs())
+            .min(len.saturating_sub(1))
+    };
+    state.select(Some(next));
+}
+
+fn table_body_row_at(area: Rect, x: u16, y: u16) -> Option<usize> {
+    if !contains(area, x, y) || y <= area.y + 1 {
+        return None;
+    }
+    Some(usize::from(y.saturating_sub(area.y + 2)))
+}
+
+#[must_use]
+fn disk_size_bytes(value: &str) -> u128 {
+    let value = value.trim();
+    let mut number = String::new();
+    let mut unit = None;
+    for ch in value.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            number.push(ch);
+        } else if ch.is_ascii_alphabetic() {
+            unit = Some(ch.to_ascii_uppercase());
+            break;
+        }
+    }
+    let (whole, fraction, scale) = decimal_parts_u128(&number);
+    let multiplier = match unit.unwrap_or('B') {
+        'K' => 1024_u128,
+        'M' => 1024_u128.pow(2),
+        'G' => 1024_u128.pow(3),
+        'T' => 1024_u128.pow(4),
+        'P' => 1024_u128.pow(5),
+        'E' => 1024_u128.pow(6),
+        _ => 1,
+    };
+    whole
+        .saturating_mul(multiplier)
+        .saturating_add(fraction.saturating_mul(multiplier) / scale)
+}
+
+fn decimal_parts_u128(number: &str) -> (u128, u128, u128) {
+    let Some((whole, fraction)) = number.split_once('.') else {
+        return (number.parse().unwrap_or(0), 0, 1);
+    };
+    let fraction_digits = fraction
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>();
+    if fraction_digits.is_empty() {
+        return (whole.parse().unwrap_or(0), 0, 1);
+    }
+    let scale = 10_u128.saturating_pow(u32::try_from(fraction_digits.len()).unwrap_or(0));
+    (
+        whole.parse().unwrap_or(0),
+        fraction_digits.parse().unwrap_or(0),
+        scale,
+    )
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -2002,6 +3448,36 @@ fn next_gpu_column(column: GpuColumn) -> GpuColumn {
     }
 }
 
+fn next_disk_column(column: DiskColumn) -> DiskColumn {
+    match column {
+        DiskColumn::Usage => DiskColumn::Path,
+        DiskColumn::Path => DiskColumn::Type,
+        DiskColumn::Type => DiskColumn::Space,
+        DiskColumn::Space => DiskColumn::Usage,
+    }
+}
+
+fn next_user_job_column(column: UserJobColumn) -> UserJobColumn {
+    match column {
+        UserJobColumn::JobId => UserJobColumn::Name,
+        UserJobColumn::Name => UserJobColumn::Node,
+        UserJobColumn::Node => UserJobColumn::Cpus,
+        UserJobColumn::Cpus => UserJobColumn::Gpus,
+        UserJobColumn::Gpus => UserJobColumn::Memory,
+        UserJobColumn::Memory => UserJobColumn::Time,
+        UserJobColumn::Time => UserJobColumn::Limit,
+        UserJobColumn::Limit => UserJobColumn::JobId,
+    }
+}
+
+fn next_disk_usage_column(column: DiskUsageColumn) -> DiskUsageColumn {
+    match column {
+        DiskUsageColumn::User => DiskUsageColumn::Used,
+        DiskUsageColumn::Used => DiskUsageColumn::Entries,
+        DiskUsageColumn::Entries => DiskUsageColumn::User,
+    }
+}
+
 fn next_accounting_column(column: AccountingColumn) -> AccountingColumn {
     match column {
         AccountingColumn::JobId => AccountingColumn::User,
@@ -2060,6 +3536,94 @@ fn gpu_column_from_index(idx: usize) -> GpuColumn {
     .get(idx)
     .copied()
     .unwrap_or(GpuColumn::Type)
+}
+
+fn disk_column_to_index(col: DiskColumn) -> usize {
+    match col {
+        DiskColumn::Usage => 0,
+        DiskColumn::Path => 1,
+        DiskColumn::Type => 2,
+        DiskColumn::Space => 3,
+    }
+}
+
+fn disk_column_from_index(idx: usize) -> DiskColumn {
+    [
+        DiskColumn::Usage,
+        DiskColumn::Path,
+        DiskColumn::Type,
+        DiskColumn::Space,
+    ]
+    .get(idx)
+    .copied()
+    .unwrap_or(DiskColumn::Space)
+}
+
+fn user_job_column_to_index(col: UserJobColumn) -> usize {
+    match col {
+        UserJobColumn::JobId => 0,
+        UserJobColumn::Name => 1,
+        UserJobColumn::Node => 2,
+        UserJobColumn::Cpus => 3,
+        UserJobColumn::Gpus => 4,
+        UserJobColumn::Memory => 5,
+        UserJobColumn::Time => 6,
+        UserJobColumn::Limit => 7,
+    }
+}
+
+fn user_job_column_from_index(idx: usize) -> UserJobColumn {
+    [
+        UserJobColumn::JobId,
+        UserJobColumn::Name,
+        UserJobColumn::Node,
+        UserJobColumn::Cpus,
+        UserJobColumn::Gpus,
+        UserJobColumn::Memory,
+        UserJobColumn::Time,
+        UserJobColumn::Limit,
+    ]
+    .get(idx)
+    .copied()
+    .unwrap_or(UserJobColumn::JobId)
+}
+
+fn disk_usage_column_to_index(col: DiskUsageColumn) -> usize {
+    match col {
+        DiskUsageColumn::User => 0,
+        DiskUsageColumn::Used => 1,
+        DiskUsageColumn::Entries => 2,
+    }
+}
+
+fn disk_usage_column_from_index(idx: usize) -> DiskUsageColumn {
+    [
+        DiskUsageColumn::User,
+        DiskUsageColumn::Used,
+        DiskUsageColumn::Entries,
+    ]
+    .get(idx)
+    .copied()
+    .unwrap_or(DiskUsageColumn::Used)
+}
+
+const fn default_user_job_direction(column: UserJobColumn) -> SortDirection {
+    match column {
+        UserJobColumn::JobId
+        | UserJobColumn::Cpus
+        | UserJobColumn::Gpus
+        | UserJobColumn::Memory
+        | UserJobColumn::Time
+        | UserJobColumn::Limit => SortDirection::Desc,
+        UserJobColumn::Name | UserJobColumn::Node => SortDirection::Asc,
+    }
+}
+
+const fn default_disk_usage_direction(column: DiskUsageColumn) -> SortDirection {
+    match column {
+        DiskUsageColumn::User => SortDirection::Asc,
+        DiskUsageColumn::Used | DiskUsageColumn::Entries => SortDirection::Desc,
+    }
 }
 
 fn accounting_column_from_index(idx: usize) -> AccountingColumn {

@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use slmtop_core::{AccountingRecord, ClusterSnapshot, DiskInfo, Job, Node};
+use slmtop_core::{AccountingRecord, ClusterSnapshot, DiskInfo, DiskUserUsage, Job, Node};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -33,6 +33,7 @@ pub type Result<T> = std::result::Result<T, SlurmError>;
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
     pub command_timeout: Duration,
+    pub disk_usage_timeout: Option<Duration>,
     pub refresh_interval: Duration,
     pub accounting_limit: usize,
     pub current_user: String,
@@ -42,6 +43,7 @@ impl Default for BackendConfig {
     fn default() -> Self {
         Self {
             command_timeout: Duration::from_secs(4),
+            disk_usage_timeout: Some(Duration::from_secs(180)),
             refresh_interval: Duration::from_secs(3),
             accounting_limit: 100,
             current_user: std::env::var("USER").unwrap_or_default(),
@@ -77,6 +79,19 @@ pub trait SlurmBackend: Send + Sync {
     /// Collects disk usage information from the local system.
     /// Returns an empty list by default so implementations can opt in.
     async fn disk_info(&self) -> Result<Vec<DiskInfo>> {
+        Ok(Vec::new())
+    }
+
+    /// Collects approximate disk usage for one user on a mount point.
+    ///
+    /// Implementations may return an empty list when ownership accounting is
+    /// unavailable, inaccessible, or too expensive for the current backend.
+    async fn disk_user_usage(
+        &self,
+        _mount: &str,
+        _user: &str,
+        _timeout: Option<Duration>,
+    ) -> Result<Vec<DiskUserUsage>> {
         Ok(Vec::new())
     }
 }

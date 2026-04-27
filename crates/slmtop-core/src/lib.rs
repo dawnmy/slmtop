@@ -89,6 +89,7 @@ pub struct Job {
     pub gpus: GpuMap,
     pub gres_raw: String,
     pub time_used: String,
+    pub time_limit: String,
     pub reason: Option<String>,
 }
 
@@ -104,7 +105,7 @@ impl Job {
     }
 
     #[must_use]
-    pub fn id_sort_key(&self) -> u64 {
+    pub fn id_sort_key(&self) -> (u64, u64) {
         numeric_job_id(&self.id)
     }
 
@@ -208,6 +209,7 @@ pub struct JobSummary {
     pub all: OwnerSummary,
     pub me: OwnerSummary,
     pub others: OwnerSummary,
+    pub users: std::collections::HashMap<String, OwnerSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -238,6 +240,20 @@ pub struct DiskInfo {
     pub label: DiskLabel,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DiskUserUsage {
+    pub user: String,
+    pub bytes: u64,
+    pub entries: u64,
+}
+
+impl DiskUserUsage {
+    #[must_use]
+    pub fn human_bytes(&self) -> String {
+        human_bytes(self.bytes)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiskLabel {
     Ssd,
@@ -264,6 +280,24 @@ impl fmt::Display for DiskLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+#[must_use]
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "K", "M", "G", "T", "P"];
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+
+    let mut unit_idx = 0;
+    let mut divisor = 1_u64;
+    while unit_idx + 1 < UNITS.len() && bytes / divisor >= 1024 {
+        divisor = divisor.saturating_mul(1024);
+        unit_idx += 1;
+    }
+
+    let tenths = bytes.saturating_mul(10) / divisor;
+    format!("{}.{:01}{}", tenths / 10, tenths % 10, UNITS[unit_idx])
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,7 +348,13 @@ pub enum PanelId {
 }
 
 impl PanelId {
-    pub const ALL: [Self; 5] = [Self::Jobs, Self::Nodes, Self::Gpus, Self::Disks, Self::Summary];
+    pub const ALL: [Self; 5] = [
+        Self::Jobs,
+        Self::Nodes,
+        Self::Gpus,
+        Self::Disks,
+        Self::Summary,
+    ];
 
     #[must_use]
     pub const fn title(self) -> &'static str {
@@ -427,9 +467,17 @@ impl FilterExpression {
 }
 
 #[must_use]
-pub fn numeric_job_id(job_id: &str) -> u64 {
-    let digits: String = job_id.chars().filter(char::is_ascii_digit).collect();
-    digits.parse().unwrap_or(u64::MAX)
+pub fn numeric_job_id(job_id: &str) -> (u64, u64) {
+    let parts: Vec<&str> = job_id
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let base = parts
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(u64::MAX);
+    let task = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (base, task)
 }
 
 #[must_use]
@@ -448,6 +496,7 @@ pub fn state_rank(state: &str) -> u8 {
     }
 }
 
+#[must_use]
 pub fn parse_slurm_time(time_str: &str) -> u64 {
     let mut days = 0;
     let mut rest = time_str;
@@ -506,7 +555,8 @@ pub fn sort_nodes(mut nodes: Vec<Node>, column: NodeColumn, direction: SortDirec
             NodeColumn::MemoryTotal => a.memory_total.cmp(&b.memory_total),
             NodeColumn::MemoryFree => a.memory_free.cmp(&b.memory_free),
             NodeColumn::GpusTotal => a.gpu_total().cmp(&b.gpu_total()),
-            NodeColumn::GpusFree => (a.gpu_total().saturating_sub(a.gpu_allocated())).cmp(&(b.gpu_total().saturating_sub(b.gpu_allocated()))),
+            NodeColumn::GpusFree => (a.gpu_total().saturating_sub(a.gpu_allocated()))
+                .cmp(&(b.gpu_total().saturating_sub(b.gpu_allocated()))),
         };
         match direction {
             SortDirection::Asc => ordering,
@@ -676,6 +726,9 @@ pub fn summarize_jobs(jobs: &[Job], current_user: &str) -> JobSummary {
             "others"
         };
         add_job_bucket(&mut summary.all, target, job);
+        let user_bucket = summary.users.entry(job.user.clone()).or_default();
+        add_job_bucket(user_bucket, target, job);
+
         if owner_bucket == "me" {
             add_job_bucket(&mut summary.me, target, job);
         } else {
