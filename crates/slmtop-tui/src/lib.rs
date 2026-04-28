@@ -124,6 +124,12 @@ struct Theme {
     warning_border: Style,
 }
 
+fn selected_row_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(8, 20, 24))
+        .bg(Color::Rgb(0, 188, 188))
+}
+
 impl Theme {
     fn from_name(name: ThemeName) -> Self {
         match name {
@@ -147,9 +153,7 @@ impl Theme {
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-            highlight: Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
+            highlight: selected_row_style(),
             status_badge: Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -184,7 +188,7 @@ impl Theme {
                 .fg(Color::Black)
                 .bg(cyan)
                 .add_modifier(Modifier::BOLD),
-            highlight: Style::default().bg(bg_sel).add_modifier(Modifier::BOLD),
+            highlight: selected_row_style(),
             status_badge: Style::default()
                 .fg(Color::Black)
                 .bg(green)
@@ -199,7 +203,7 @@ impl Theme {
             summary_me: Style::default().fg(green),
             summary_others: Style::default().fg(orange),
             _bar_filled: green,
-            _bar_empty: Color::Rgb(73, 72, 62),
+            _bar_empty: bg_sel,
             warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
         }
     }
@@ -218,7 +222,7 @@ impl Theme {
                 .fg(Color::Rgb(30, 30, 46))
                 .bg(mauve)
                 .add_modifier(Modifier::BOLD),
-            highlight: Style::default().bg(surface1).add_modifier(Modifier::BOLD),
+            highlight: selected_row_style(),
             status_badge: Style::default()
                 .fg(Color::Rgb(30, 30, 46))
                 .bg(mauve)
@@ -252,7 +256,7 @@ impl Theme {
                 .fg(Color::Rgb(40, 44, 52))
                 .bg(blue)
                 .add_modifier(Modifier::BOLD),
-            highlight: Style::default().bg(gutter).add_modifier(Modifier::BOLD),
+            highlight: selected_row_style(),
             status_badge: Style::default()
                 .fg(Color::Rgb(40, 44, 52))
                 .bg(blue)
@@ -286,7 +290,7 @@ impl Theme {
                 .fg(Color::Rgb(1, 22, 39))
                 .bg(cyan)
                 .add_modifier(Modifier::BOLD),
-            highlight: Style::default().bg(surface).add_modifier(Modifier::BOLD),
+            highlight: selected_row_style(),
             status_badge: Style::default()
                 .fg(Color::Rgb(1, 22, 39))
                 .bg(cyan)
@@ -320,9 +324,7 @@ impl Theme {
                 .fg(Color::Rgb(26, 27, 38))
                 .bg(blue)
                 .add_modifier(Modifier::BOLD),
-            highlight: Style::default()
-                .bg(bg_highlight)
-                .add_modifier(Modifier::BOLD),
+            highlight: selected_row_style(),
             status_badge: Style::default()
                 .fg(Color::Rgb(26, 27, 38))
                 .bg(blue)
@@ -356,9 +358,7 @@ impl Theme {
                 .fg(Color::Rgb(40, 42, 54))
                 .bg(purple)
                 .add_modifier(Modifier::BOLD),
-            highlight: Style::default()
-                .bg(bg_highlight)
-                .add_modifier(Modifier::BOLD),
+            highlight: selected_row_style(),
             status_badge: Style::default()
                 .fg(Color::Rgb(40, 42, 54))
                 .bg(purple)
@@ -442,7 +442,7 @@ where
                         return Ok(());
                     }
                 }
-                CrosstermEvent::Mouse(mouse) => app.handle_mouse(mouse),
+                CrosstermEvent::Mouse(mouse) => app.handle_mouse(mouse, backend, &tx),
                 CrosstermEvent::Resize(_, _)
                 | CrosstermEvent::FocusGained
                 | CrosstermEvent::FocusLost
@@ -788,6 +788,23 @@ impl PanelUiState {
     }
 }
 
+const DOUBLE_CLICK_MAX_INTERVAL: Duration = Duration::from_millis(450);
+
+#[derive(Debug, Clone, Copy)]
+struct RowClick {
+    panel: PanelId,
+    row: usize,
+    at: Instant,
+}
+
+impl RowClick {
+    fn matches(self, panel: PanelId, row: usize, at: Instant) -> bool {
+        self.panel == panel
+            && self.row == row
+            && at.saturating_duration_since(self.at) <= DOUBLE_CLICK_MAX_INTERVAL
+    }
+}
+
 struct AppState {
     current_user: String,
     refresh_interval: Duration,
@@ -835,6 +852,7 @@ struct AppState {
     header_hits: Vec<HeaderHit>,
     modal_header_hits: Vec<ModalHeaderHit>,
     modal_table_hits: Vec<ModalTableHit>,
+    last_row_click: Option<RowClick>,
     theme_name: ThemeName,
     theme: Theme,
 }
@@ -920,6 +938,7 @@ impl AppState {
             header_hits: Vec::new(),
             modal_header_hits: Vec::new(),
             modal_table_hits: Vec::new(),
+            last_row_click: None,
             theme_name,
             theme: Theme::from_name(theme_name),
         }
@@ -1599,9 +1618,11 @@ impl AppState {
             }
             KeyCode::Char('s') => {
                 self.user_details_sort = next_user_job_column(self.user_details_sort);
+                reset_table_to_top(self.active_user_details_table_mut());
             }
             KeyCode::Char('d') => {
                 self.user_details_direction = self.user_details_direction.toggled();
+                reset_table_to_top(self.active_user_details_table_mut());
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_user_details_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_user_details_selection(-1),
@@ -1639,9 +1660,11 @@ impl AppState {
             }
             KeyCode::Char('s') => {
                 self.disk_usage_sort = next_disk_usage_column(self.disk_usage_sort);
+                reset_table_to_top(&mut self.disk_usage_table);
             }
             KeyCode::Char('d') => {
                 self.disk_usage_direction = self.disk_usage_direction.toggled();
+                reset_table_to_top(&mut self.disk_usage_table);
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_disk_usage_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_disk_usage_selection(-1),
@@ -1709,7 +1732,10 @@ impl AppState {
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
+    fn handle_mouse<B>(&mut self, mouse: MouseEvent, backend: &Arc<B>, tx: &mpsc::Sender<UiMessage>)
+    where
+        B: SlurmClient + 'static,
+    {
         if self.handle_modal_mouse(mouse) {
             return;
         }
@@ -1724,18 +1750,29 @@ impl AppState {
         {
             self.focus_visible(hit.panel);
             self.apply_header_sort(hit.panel, hit.column);
+            self.last_row_click = None;
             return;
         }
         for panel in PanelId::ALL {
             if let Some(area) = self.panel_areas[panel.index()] {
                 if contains(area, mouse.column, mouse.row) {
                     self.focus_visible(panel);
-                    let row = mouse.row.saturating_sub(area.y + 2) as usize;
-                    self.select_row(panel, row);
+                    if let Some(row) = table_body_row_at(area, mouse.column, mouse.row) {
+                        if let Some(selected) = self.select_visible_row(panel, row) {
+                            if self.register_row_click(panel, selected) {
+                                self.open_focused_details(Arc::clone(backend), tx.clone());
+                            }
+                        } else {
+                            self.last_row_click = None;
+                        }
+                    } else {
+                        self.last_row_click = None;
+                    }
                     return;
                 }
             }
         }
+        self.last_row_click = None;
     }
 
     fn handle_modal_mouse(&mut self, mouse: MouseEvent) -> bool {
@@ -1808,8 +1845,7 @@ impl AppState {
                 if let Some(hit) = self.modal_table_at(mouse.column, mouse.row) {
                     if hit.table == ModalTable::DiskUsage {
                         if let Some(row) = table_body_row_at(hit.area, mouse.column, mouse.row) {
-                            let selected = self.disk_usage_table.offset().saturating_add(row);
-                            self.disk_usage_table.select(Some(selected));
+                            self.select_visible_disk_usage_row(row);
                         }
                     }
                 }
@@ -2051,23 +2087,59 @@ impl AppState {
     }
 
     fn move_selection(&mut self, delta: isize) {
+        let len = self.panel_row_count(self.focus);
         let table = self.focused_table_mut();
-        let current = table.selected().unwrap_or(0);
-        let next = if delta.is_negative() {
-            current.saturating_sub(delta.unsigned_abs())
-        } else {
-            current.saturating_add(delta.unsigned_abs())
-        };
-        table.select(Some(next));
+        move_table_selection(table, len, delta);
     }
 
-    fn select_row(&mut self, panel: PanelId, row: usize) {
+    fn select_visible_row(&mut self, panel: PanelId, visible_row: usize) -> Option<usize> {
+        let len = self.panel_row_count(panel);
+        let table = self.panel_table_mut(panel);
+        select_visible_table_row(table, len, visible_row)
+    }
+
+    fn register_row_click(&mut self, panel: PanelId, row: usize) -> bool {
+        let at = Instant::now();
+        let is_double_click = self
+            .last_row_click
+            .is_some_and(|click| click.matches(panel, row, at));
+        self.last_row_click = if is_double_click {
+            None
+        } else {
+            Some(RowClick { panel, row, at })
+        };
+        is_double_click
+    }
+
+    fn panel_row_count(&self, panel: PanelId) -> usize {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return 0;
+        };
         match panel {
-            PanelId::Jobs => self.jobs_table.select(Some(row)),
-            PanelId::Nodes => self.nodes_table.select(Some(row)),
-            PanelId::Gpus => self.gpus_table.select(Some(row)),
-            PanelId::Summary => self.summary_table.select(Some(row)),
-            PanelId::Disks => self.disks_table.select(Some(row)),
+            PanelId::Jobs => filter_jobs(
+                &snapshot.snapshot.jobs,
+                &self.panels[PanelId::Jobs.index()].filter,
+                &self.current_user,
+            )
+            .len(),
+            PanelId::Nodes => filter_nodes(
+                &snapshot.snapshot.nodes,
+                &self.panels[PanelId::Nodes.index()].filter,
+            )
+            .len(),
+            PanelId::Gpus => snapshot.snapshot.gpu_summary.by_type.len() + 1,
+            PanelId::Summary => self.summary_display_rows().len(),
+            PanelId::Disks => snapshot.snapshot.disk_info.len(),
+        }
+    }
+
+    fn panel_table_mut(&mut self, panel: PanelId) -> &mut TableState {
+        match panel {
+            PanelId::Jobs => &mut self.jobs_table,
+            PanelId::Nodes => &mut self.nodes_table,
+            PanelId::Gpus => &mut self.gpus_table,
+            PanelId::Summary => &mut self.summary_table,
+            PanelId::Disks => &mut self.disks_table,
         }
     }
 
@@ -2092,15 +2164,19 @@ impl AppState {
     }
 
     fn select_visible_user_details_row(&mut self, section: UserJobSection, visible_row: usize) {
+        let len = self.user_details_len(section).unwrap_or(0);
         let table = self.user_details_table_mut(section);
-        let selected = table.offset().saturating_add(visible_row);
-        table.select(Some(selected));
+        select_visible_table_row(table, len, visible_row);
     }
 
     fn active_user_details_len(&self) -> Option<usize> {
+        self.user_details_len(self.user_details_section)
+    }
+
+    fn user_details_len(&self, section: UserJobSection) -> Option<usize> {
         let user = self.details_user.as_ref()?;
         let (running, pending) = self.user_detail_jobs(user);
-        Some(match self.user_details_section {
+        Some(match section {
             UserJobSection::Running => running.len(),
             UserJobSection::Pending => pending.len(),
         })
@@ -2122,6 +2198,11 @@ impl AppState {
         move_table_selection(&mut self.disk_usage_table, len, delta);
     }
 
+    fn select_visible_disk_usage_row(&mut self, visible_row: usize) {
+        let len = self.active_disk_usage_len().unwrap_or(0);
+        select_visible_table_row(&mut self.disk_usage_table, len, visible_row);
+    }
+
     fn active_disk_usage_len(&self) -> Option<usize> {
         self.details_disk
             .as_ref()
@@ -2129,18 +2210,14 @@ impl AppState {
     }
 
     fn focused_table_mut(&mut self) -> &mut TableState {
-        match self.focus {
-            PanelId::Jobs => &mut self.jobs_table,
-            PanelId::Nodes => &mut self.nodes_table,
-            PanelId::Gpus => &mut self.gpus_table,
-            PanelId::Summary => &mut self.summary_table,
-            PanelId::Disks => &mut self.disks_table,
-        }
+        self.panel_table_mut(self.focus)
     }
 
     fn toggle_direction(&mut self) {
         let idx = self.focus.index();
         self.directions[idx] = self.directions[idx].toggled();
+        let focus = self.focus;
+        reset_table_to_top(self.panel_table_mut(focus));
     }
 
     fn toggle_column(&mut self) {
@@ -2155,6 +2232,8 @@ impl AppState {
             PanelId::Summary => self.accounting_sort = next_accounting_column(self.accounting_sort),
             PanelId::Disks => self.disk_sort = next_disk_column(self.disk_sort),
         }
+        let focus = self.focus;
+        reset_table_to_top(self.panel_table_mut(focus));
     }
 
     fn apply_header_sort(&mut self, panel: PanelId, visible_column: usize) {
@@ -2166,7 +2245,8 @@ impl AppState {
             PanelId::Summary => self.accounting_sort = accounting_column_from_index(actual),
             PanelId::Disks => self.disk_sort = disk_column_from_index(actual),
         }
-        self.toggle_direction();
+        self.directions[panel.index()] = self.directions[panel.index()].toggled();
+        reset_table_to_top(self.panel_table_mut(panel));
     }
 
     fn set_user_details_sort(&mut self, column: UserJobColumn) {
@@ -2176,6 +2256,7 @@ impl AppState {
             self.user_details_sort = column;
             self.user_details_direction = default_user_job_direction(column);
         }
+        reset_table_to_top(self.active_user_details_table_mut());
     }
 
     fn set_disk_usage_sort(&mut self, column: DiskUsageColumn) {
@@ -2185,6 +2266,7 @@ impl AppState {
             self.disk_usage_sort = column;
             self.disk_usage_direction = default_disk_usage_direction(column);
         }
+        reset_table_to_top(&mut self.disk_usage_table);
     }
 
     fn set_user_details_section_under_mouse(&mut self, x: u16, y: u16) {
@@ -3503,11 +3585,38 @@ fn move_table_selection(state: &mut TableState, len: usize, delta: isize) {
     state.select(Some(next));
 }
 
-fn table_body_row_at(area: Rect, x: u16, y: u16) -> Option<usize> {
-    if !contains(area, x, y) || y <= area.y + 1 {
+fn select_visible_table_row(
+    state: &mut TableState,
+    len: usize,
+    visible_row: usize,
+) -> Option<usize> {
+    if len == 0 {
+        state.select(None);
         return None;
     }
-    Some(usize::from(y.saturating_sub(area.y + 2)))
+    let selected = state.offset().saturating_add(visible_row);
+    if selected < len {
+        state.select(Some(selected));
+        Some(selected)
+    } else {
+        None
+    }
+}
+
+fn reset_table_to_top(state: &mut TableState) {
+    *state.offset_mut() = 0;
+    state.select(Some(0));
+}
+
+fn table_body_row_at(area: Rect, x: u16, y: u16) -> Option<usize> {
+    let content_left = area.x.saturating_add(1);
+    let content_right = area.x.saturating_add(area.width).saturating_sub(1);
+    let first_row_y = area.y.saturating_add(2);
+    let after_last_row_y = area.y.saturating_add(area.height).saturating_sub(1);
+    if x < content_left || x >= content_right || y < first_row_y || y >= after_last_row_y {
+        return None;
+    }
+    Some(usize::from(y.saturating_sub(first_row_y)))
 }
 
 #[must_use]
@@ -3847,4 +3956,86 @@ pub fn snapshot_age(snapshot: &ClusterSnapshot) -> Option<Duration> {
 #[must_use]
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_row_style_uses_truecolor_dark_text_on_teal() {
+        let style = selected_row_style();
+        assert_eq!(style.fg, Some(Color::Rgb(8, 20, 24)));
+        assert_eq!(style.bg, Some(Color::Rgb(0, 188, 188)));
+        assert!(!style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn table_body_row_at_excludes_borders_and_header() {
+        let area = Rect::new(10, 5, 20, 8);
+
+        assert_eq!(table_body_row_at(area, 11, 5), None);
+        assert_eq!(table_body_row_at(area, 11, 6), None);
+        assert_eq!(table_body_row_at(area, 10, 7), None);
+        assert_eq!(table_body_row_at(area, 29, 7), None);
+        assert_eq!(table_body_row_at(area, 11, 12), None);
+        assert_eq!(table_body_row_at(area, 11, 7), Some(0));
+        assert_eq!(table_body_row_at(area, 11, 11), Some(4));
+    }
+
+    #[test]
+    fn visible_table_row_selection_preserves_scroll_offset() {
+        let mut state = TableState::default()
+            .with_offset(10)
+            .with_selected(Some(12));
+
+        let selected = select_visible_table_row(&mut state, 50, 3);
+
+        assert_eq!(selected, Some(13));
+        assert_eq!(state.offset(), 10);
+        assert_eq!(state.selected(), Some(13));
+    }
+
+    #[test]
+    fn visible_table_row_selection_ignores_clicks_past_rows() {
+        let mut state = TableState::default()
+            .with_offset(10)
+            .with_selected(Some(11));
+
+        let selected = select_visible_table_row(&mut state, 12, 3);
+
+        assert_eq!(selected, None);
+        assert_eq!(state.selected(), Some(11));
+    }
+
+    #[test]
+    fn row_click_matches_same_row_within_double_click_interval() {
+        let at = Instant::now();
+        let click = RowClick {
+            panel: PanelId::Jobs,
+            row: 7,
+            at,
+        };
+
+        assert!(click.matches(PanelId::Jobs, 7, at + Duration::from_millis(449)));
+        assert!(!click.matches(PanelId::Nodes, 7, at + Duration::from_millis(1)));
+        assert!(!click.matches(PanelId::Jobs, 8, at + Duration::from_millis(1)));
+        assert!(!click.matches(
+            PanelId::Jobs,
+            7,
+            at + DOUBLE_CLICK_MAX_INTERVAL + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn reset_table_to_top_clears_scroll_offset_and_selection() {
+        let mut state = TableState::default()
+            .with_offset(42)
+            .with_selected(Some(47));
+
+        reset_table_to_top(&mut state);
+
+        assert_eq!(state.offset(), 0);
+        assert_eq!(state.selected(), Some(0));
+    }
 }

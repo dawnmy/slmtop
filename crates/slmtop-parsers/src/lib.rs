@@ -1,11 +1,14 @@
 //! Parsers for Slurm command output.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use regex::Regex;
 use slmtop_core::{
     AccountingRecord, CpuCounts, DiskInfo, DiskLabel, DiskUserUsage, GpuMap, Job, MemoryMb, Node,
 };
+
+static GPU_REGEX: OnceLock<std::result::Result<Regex, regex::Error>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parsed<T> {
@@ -174,7 +177,7 @@ pub fn parse_gpu_map(value: &str) -> GpuMap {
         return BTreeMap::new();
     }
 
-    let Ok(regex) = Regex::new(r"gpu(?::([^,=():]+))?[=:](\d+)") else {
+    let Ok(regex) = GPU_REGEX.get_or_init(|| Regex::new(r"gpu(?::([^,=():]+))?[=:](\d+)")) else {
         return BTreeMap::new();
     };
     let mut map = BTreeMap::new();
