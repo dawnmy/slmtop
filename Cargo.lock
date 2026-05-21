@@ -1328,7 +1328,7 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "slmtop"
-version = "0.2.12"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "slmtop-core"
-version = "0.2.12"
+version = "0.3.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "slmtop-parsers"
-version = "0.2.12"
+version = "0.3.0"
 dependencies = [
  "pretty_assertions",
  "regex",
@@ -1358,7 +1358,7 @@ dependencies = [
 
 [[package]]
 name = "slmtop-slurm"
-version = "0.2.12"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "slmtop-core",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "slmtop-slurm-cli"
-version = "0.2.12"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "shell-words",
@@ -1381,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "slmtop-tui"
-version = "0.2.12"
+version = "0.3.0"
 dependencies = [
  "crossterm",
  "ratatui",

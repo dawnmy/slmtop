@@ -81,6 +81,8 @@ pub struct Job {
     pub user: String,
     pub state: String,
     pub partition: String,
+    pub qos: String,
+    pub priority: u64,
     pub name: String,
     pub nodes: String,
     pub node_list: String,
@@ -110,13 +112,31 @@ impl Job {
     }
 
     #[must_use]
+    pub fn status_reason(&self) -> String {
+        self.reason
+            .as_ref()
+            .map(|reason| reason.trim())
+            .filter(|reason| {
+                !reason.is_empty()
+                    && !matches!(
+                        reason.to_ascii_lowercase().as_str(),
+                        "none" | "n/a" | "(null)" | "null"
+                    )
+            })
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "—".to_string())
+    }
+
+    #[must_use]
     pub fn searchable_text(&self) -> String {
         format!(
-            "{} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {} {}",
             self.id,
             self.user,
             self.state,
             self.partition,
+            self.qos,
+            self.priority,
             self.name,
             self.nodes,
             self.node_list,
@@ -386,6 +406,8 @@ pub enum JobColumn {
     JobId,
     User,
     Partition,
+    Qos,
+    Priority,
     Name,
     Nodes,
     Cpus,
@@ -529,6 +551,8 @@ pub fn sort_jobs(mut jobs: Vec<Job>, column: JobColumn, direction: SortDirection
             JobColumn::JobId => a.id_sort_key().cmp(&b.id_sort_key()),
             JobColumn::User => a.user.to_lowercase().cmp(&b.user.to_lowercase()),
             JobColumn::Partition => a.partition.to_lowercase().cmp(&b.partition.to_lowercase()),
+            JobColumn::Qos => a.qos.to_lowercase().cmp(&b.qos.to_lowercase()),
+            JobColumn::Priority => a.priority.cmp(&b.priority),
             JobColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             JobColumn::Nodes => a.nodes.cmp(&b.nodes),
             JobColumn::Cpus => a.cpus.cmp(&b.cpus),

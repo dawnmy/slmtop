@@ -897,10 +897,10 @@ impl AppState {
             details_user: None,
             details_disk: None,
             pending_action: None,
-            left_percent: 55,
+            left_percent: 60,
             top_percent: 68,
             panels: [
-                PanelUiState::new(10),
+                PanelUiState::new(12),
                 PanelUiState::new(8),
                 PanelUiState::new(5),
                 PanelUiState::new(4),
@@ -1110,7 +1110,8 @@ impl AppState {
         let rows = self.visible_jobs();
         clamp_selection(&mut self.jobs_table, rows.len());
         let headers = [
-            "JOBID", "USER", "STATE", "PART", "NAME", "NODE", "CPU", "GPU", "MEM", "TIME",
+            "JOBID", "USER", "STATE", "PART", "QOS", "PRI", "NAME", "NODE", "CPU", "GPU", "MEM",
+            "TIME",
         ];
         let sort_idx = job_column_to_index(self.jobs_sort);
         let direction = self.directions[PanelId::Jobs.index()];
@@ -1122,6 +1123,8 @@ impl AppState {
                 job.user.clone(),
                 job.state.clone(),
                 job.partition.clone(),
+                job.qos.clone(),
+                job.priority.to_string(),
                 job.name.clone(),
                 job.nodes.clone(),
                 job.cpus.to_string(),
@@ -1135,10 +1138,14 @@ impl AppState {
         for (i, &is_visible) in visible.iter().enumerate() {
             if is_visible {
                 constraints.push(match headers[i] {
-                    "NAME" => Constraint::Percentage(20),
-                    "MEM" => Constraint::Percentage(10),
-                    "TIME" => Constraint::Percentage(14),
-                    _ => Constraint::Percentage(8),
+                    "JOBID" | "USER" | "PART" => Constraint::Percentage(7),
+                    "STATE" => Constraint::Percentage(6),
+                    "QOS" | "MEM" => Constraint::Percentage(9),
+                    "PRI" | "CPU" | "GPU" => Constraint::Percentage(5),
+                    "NAME" => Constraint::Percentage(16),
+                    "NODE" => Constraint::Percentage(6),
+                    "TIME" => Constraint::Percentage(12),
+                    _ => Constraint::Percentage(7),
                 });
             }
         }
@@ -1422,7 +1429,10 @@ impl AppState {
             Line::from(format!("Job ID    : {}", job.id)),
             Line::from(format!("User      : {}", job.user)),
             Line::from(format!("State     : {}", job.state)),
+            Line::from(format!("Reason    : {}", job.status_reason())),
             Line::from(format!("Partition : {}", job.partition)),
+            Line::from(format!("QOS       : {}", job.qos)),
+            Line::from(format!("Priority  : {}", job.priority)),
             Line::from(format!("Name      : {}", job.name)),
             Line::from(format!("Nodes     : {}", job.nodes)),
         ];
@@ -1433,7 +1443,8 @@ impl AppState {
             Line::from(format!("CPUs      : {}", job.cpus)),
             Line::from(format!("GPUs      : {gpu_text}")),
             Line::from(format!("Memory    : {}", job.memory)),
-            Line::from(format!("Time      : {}", job.time_used)),
+            Line::from(format!("Time Used  : {}", slurm_time_display(&job.time_used))),
+            Line::from(format!("Time Limit : {}", slurm_time_display(&job.time_limit))),
             Line::from(""),
             Line::from("c cancel | h hold | u release | r requeue | Esc close"),
         ]);
@@ -3301,6 +3312,21 @@ fn merge_owner_summary(total: &mut OwnerSummary, stats: &OwnerSummary) {
     total.pending.memory.0 += stats.pending.memory.0;
 }
 
+#[must_use]
+fn slurm_time_display(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty()
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "none" | "n/a" | "(null)" | "null"
+        )
+    {
+        "—".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn gpu_map_display(job: &Job) -> String {
     if job.gpus.is_empty() {
         return "0".to_string();
@@ -3490,12 +3516,14 @@ fn job_column_to_index(col: JobColumn) -> usize {
         JobColumn::User => 1,
         JobColumn::State => 2,
         JobColumn::Partition => 3,
-        JobColumn::Name => 4,
-        JobColumn::Nodes => 5,
-        JobColumn::Cpus => 6,
-        JobColumn::Gpus => 7,
-        JobColumn::Memory => 8,
-        JobColumn::Time => 9,
+        JobColumn::Qos => 4,
+        JobColumn::Priority => 5,
+        JobColumn::Name => 6,
+        JobColumn::Nodes => 7,
+        JobColumn::Cpus => 8,
+        JobColumn::Gpus => 9,
+        JobColumn::Memory => 10,
+        JobColumn::Time => 11,
     }
 }
 
@@ -3721,7 +3749,9 @@ fn next_job_column(column: JobColumn) -> JobColumn {
         JobColumn::State => JobColumn::JobId,
         JobColumn::JobId => JobColumn::User,
         JobColumn::User => JobColumn::Partition,
-        JobColumn::Partition => JobColumn::Name,
+        JobColumn::Partition => JobColumn::Qos,
+        JobColumn::Qos => JobColumn::Priority,
+        JobColumn::Priority => JobColumn::Name,
         JobColumn::Name => JobColumn::Nodes,
         JobColumn::Nodes => JobColumn::Cpus,
         JobColumn::Cpus => JobColumn::Gpus,
@@ -3803,6 +3833,8 @@ fn job_column_from_index(idx: usize) -> JobColumn {
         JobColumn::User,
         JobColumn::State,
         JobColumn::Partition,
+        JobColumn::Qos,
+        JobColumn::Priority,
         JobColumn::Name,
         JobColumn::Nodes,
         JobColumn::Cpus,

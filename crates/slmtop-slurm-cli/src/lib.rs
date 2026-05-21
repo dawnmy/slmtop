@@ -124,7 +124,12 @@ impl SlurmBackend for CliSlurmBackend {
         let output = self
             .run(
                 "squeue",
-                &["-a", "-h", "-o", "%i|%u|%T|%P|%j|%D|%C|%m|%b|%M|%N|%R|%l"],
+                &[
+                    "-a",
+                    "-h",
+                    "-o",
+                    "%i|%u|%T|%P|%q|%Q|%j|%D|%C|%m|%b|%M|%N|%R|%l",
+                ],
                 false,
             )
             .await?;

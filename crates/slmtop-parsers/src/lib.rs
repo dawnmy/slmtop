@@ -33,7 +33,7 @@ pub fn parse_squeue(output: &str) -> Parsed<Job> {
             continue;
         }
         let parts: Vec<_> = line.split('|').map(str::trim).collect();
-        if parts.len() < 11 {
+        if parts.len() < 13 {
             warnings.push(format!(
                 "squeue line {} has {} fields: {line}",
                 idx + 1,
@@ -46,19 +46,21 @@ pub fn parse_squeue(output: &str) -> Parsed<Job> {
             user: parts[1].to_string(),
             state: parts[2].to_string(),
             partition: parts[3].to_string(),
-            name: parts[4].to_string(),
-            nodes: parts[5].to_string(),
-            cpus: parse_u64(parts[6]),
-            memory: parse_memory_mb(parts[7]),
-            gpus: parse_gpu_map(parts[8]),
-            gres_raw: parts[8].to_string(),
-            time_used: parts[9].to_string(),
-            node_list: parts[10].to_string(),
+            qos: parts[4].to_string(),
+            priority: parse_u64(parts[5]),
+            name: parts[6].to_string(),
+            nodes: parts[7].to_string(),
+            cpus: parse_u64(parts[8]),
+            memory: parse_memory_mb(parts[9]),
+            gpus: parse_gpu_map(parts[10]),
+            gres_raw: parts[10].to_string(),
+            time_used: parts[11].to_string(),
+            node_list: parts[12].to_string(),
             reason: parts
-                .get(11)
+                .get(13)
                 .filter(|value| !value.is_empty())
                 .map(|value| (*value).to_string()),
-            time_limit: parts.get(12).map_or_else(String::new, |s| (*s).to_string()),
+            time_limit: parts.get(14).map_or_else(String::new, |s| (*s).to_string()),
         });
     }
     Parsed::new(jobs, warnings)
@@ -537,13 +539,17 @@ mod tests {
 
     #[test]
     fn parses_squeue_rows() {
-        let output = "123|alice|RUNNING|gpu|train|1|8|32G|gpu:a100:2|01:02:03|node001|None\n";
+        let output =
+            "123|alice|RUNNING|gpu|normal|5000|train|1|8|32G|gpu:a100:2|01:02:03|node001|Resources|01:00:00\n";
         let parsed = parse_squeue(output);
         assert!(parsed.warnings.is_empty());
         assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.rows[0].qos, "normal");
+        assert_eq!(parsed.rows[0].priority, 5000);
         assert_eq!(parsed.rows[0].gpu_total(), 2);
         assert_eq!(parsed.rows[0].memory.0, 32 * 1024);
         assert_eq!(parsed.rows[0].node_list, "node001");
+        assert_eq!(parsed.rows[0].reason.as_deref(), Some("Resources"));
     }
 
     #[test]
