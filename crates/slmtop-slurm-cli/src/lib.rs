@@ -140,22 +140,57 @@ impl SlurmBackend for CliSlurmBackend {
     }
 
     async fn nodes(&self) -> Result<(Vec<Node>, CommandTelemetry)> {
-        let output = self
-            .run(
-                "sinfo",
-                &[
-                    "-N",
-                    "-h",
-                    "-O",
-                    "NodeHost:|,StateCompact:|,CPUs:|,CPUsState:|,Memory:|,FreeMem:|,Gres:|,Reason:|,GresUsed:500",
-                ],
-                false,
-            )
-            .await?;
-        let parsed = parse_sinfo(&output.stdout);
-        let mut telemetry = output.telemetry;
-        telemetry.warnings.extend(parsed.warnings);
-        Ok((parsed.rows, telemetry))
+        // Slurm output format varies by version:
+        // - `-o '%n|%t|...'` emits explicit pipe delimiters (preferred).
+        // - `-O Field1,Field2,...` emits fixed-width columns separated by spaces.
+        // Older slmtop used `-O` with `NodeHost:|` which is NOT a portable delimiter
+        // spec; many clusters (including the reported bartalloc1616 case) returned
+        // space-separated lines that the pipe-only parser could not read.
+        const FORMATS: &[&[&str]] = &[
+            &["-N", "-h", "-o", "%n|%t|%c|%C|%m|%e|%G|%E"],
+            &["-N", "-h", "-o", "%n|%t|%c|%C|%m|%e|%G"],
+            &["-N", "-h", "-o", "%N|%T|%c|%C|%m|%e|%G|%E"],
+            &[
+                "-N",
+                "-h",
+                "-O",
+                "NodeHost,StateCompact,CPUs,CPUsState,Memory,FreeMem,Gres,Reason",
+            ],
+        ];
+
+        let mut best: Option<(Vec<Node>, CommandTelemetry)> = None;
+        let mut best_score = (0_usize, usize::MAX);
+
+        for args in FORMATS {
+            let output = self.run("sinfo", args, false).await?;
+            let parsed = parse_sinfo(&output.stdout);
+            let score = (parsed.rows.len(), parsed.warnings.len());
+            let mut telemetry = output.telemetry;
+            telemetry.warnings.extend(parsed.warnings);
+
+            if score.0 > 0 && score.1 == 0 {
+                return Ok((parsed.rows, telemetry));
+            }
+
+            let better =
+                score.0 > best_score.0 || (score.0 == best_score.0 && score.1 < best_score.1);
+            if better {
+                best_score = score;
+                best = Some((parsed.rows, telemetry));
+            }
+        }
+
+        let Some((rows, telemetry)) = best else {
+            return Err(SlurmError::Parse(
+                "sinfo returned no recognizable node rows".to_string(),
+            ));
+        };
+        if rows.is_empty() {
+            return Err(SlurmError::Parse(
+                "sinfo returned no recognizable node rows".to_string(),
+            ));
+        }
+        Ok((rows, telemetry))
     }
 
     async fn accounting(&self, limit: usize) -> Result<(Vec<AccountingRecord>, CommandTelemetry)> {

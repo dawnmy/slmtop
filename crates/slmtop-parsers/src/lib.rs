@@ -9,6 +9,8 @@ use slmtop_core::{
 };
 
 static GPU_REGEX: OnceLock<std::result::Result<Regex, regex::Error>> = OnceLock::new();
+static SINFO_GAP_REGEX: OnceLock<std::result::Result<Regex, regex::Error>> = OnceLock::new();
+static SINFO_HEURISTIC_REGEX: OnceLock<std::result::Result<Regex, regex::Error>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parsed<T> {
@@ -75,41 +77,96 @@ pub fn parse_sinfo(output: &str) -> Parsed<Node> {
         if line.is_empty()
             || looks_like_header(line, "NODELIST")
             || looks_like_header(line, "HOSTNAMES")
+            || looks_like_header(line, "NODEHOST")
         {
             continue;
         }
-        let parts: Vec<_> = line.split('|').map(str::trim).collect();
-        if parts.len() < 7 {
-            warnings.push(format!(
-                "sinfo line {} has {} fields: {line}",
-                idx + 1,
-                parts.len()
-            ));
-            continue;
+        match parse_sinfo_line(line) {
+            Ok(node) => nodes.push(node),
+            Err(reason) => warnings.push(format!("sinfo line {}: {reason}: {line}", idx + 1)),
         }
-        let cpus = parse_cpu_state(parts[3], parse_u64(parts[2]));
-        let total = parse_memory_mb(parts[4]);
-        let free = parse_memory_mb(parts[5]);
-        let reserved = total.saturating_sub(free);
-        nodes.push(Node {
-            name: parts[0].to_string(),
-            state: parts[1].to_string(),
-            cpus,
-            memory_total: total,
-            memory_reserved: reserved,
-            memory_free: free,
-            gpus: parse_gpu_map(parts[6]),
-            gpus_allocated: parts
-                .get(8)
-                .map_or_else(GpuMap::default, |s| parse_gpu_map(s)),
-            gres_raw: parts[6].to_string(),
-            reason: parts
-                .get(7)
-                .filter(|value| !value.is_empty())
-                .map(|value| (*value).to_string()),
-        });
     }
     Parsed::new(nodes, warnings)
+}
+
+/// Split one `sinfo` line into the canonical 7+ field layout used by [`parse_sinfo`].
+///
+/// Slurm output varies by version and by whether the caller used `-o` (custom format
+/// string) or `-O` (named fixed-width columns). We try, in order:
+/// 1. Pipe-delimited (`-o '%n|%t|...'`) — most reliable when supported.
+/// 2. Wide whitespace gaps (`-O` fixed-width columns).
+/// 3. Heuristic tokenization around the `alloc/idle[/other/total]` CPU field.
+fn split_sinfo_fields(line: &str) -> Option<Vec<String>> {
+    let pipe_parts: Vec<String> = line
+        .split('|')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect();
+    if pipe_parts.len() >= 7 {
+        return Some(pipe_parts);
+    }
+
+    let wide_parts = split_on_wide_whitespace(line);
+    if wide_parts.len() >= 7 {
+        return Some(wide_parts);
+    }
+
+    let Ok(regex) = SINFO_HEURISTIC_REGEX.get_or_init(|| {
+        Regex::new(r"^(\S+)\s+(\S+)\s+(\d+)\s+(\d+(?:/\d+)+)\s+(\S+)\s+(\S+)\s+(.+)$")
+    }) else {
+        return None;
+    };
+    let captures = regex.captures(line)?;
+    let mut parts = Vec::with_capacity(7);
+    for idx in 1..=7 {
+        parts.push(captures.get(idx)?.as_str().trim().to_string());
+    }
+    Some(parts)
+}
+
+fn split_on_wide_whitespace(line: &str) -> Vec<String> {
+    let Ok(regex) = SINFO_GAP_REGEX.get_or_init(|| Regex::new(r"\s{2,}")) else {
+        return Vec::new();
+    };
+    regex
+        .split(line)
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn parse_sinfo_line(line: &str) -> Result<Node, &'static str> {
+    let parts = split_sinfo_fields(line).ok_or("unrecognized layout")?;
+    if parts.len() < 7 {
+        return Err("too few fields");
+    }
+
+    let cpus = parse_cpu_state(&parts[3], parse_u64(&parts[2]));
+    let total = parse_memory_mb(&parts[4]);
+    let free = parse_memory_mb(&parts[5]);
+    let reserved = total.saturating_sub(free);
+    let gres_raw = parts[6].clone();
+    let reason = parts
+        .get(7)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string());
+
+    Ok(Node {
+        name: parts[0].clone(),
+        state: parts[1].clone(),
+        cpus,
+        memory_total: total,
+        memory_reserved: reserved,
+        memory_free: free,
+        gpus: parse_gpu_map(&gres_raw),
+        gpus_allocated: parts
+            .get(8)
+            .map_or_else(GpuMap::default, |value| parse_gpu_map(value)),
+        gres_raw,
+        reason,
+    })
 }
 
 #[must_use]
@@ -557,9 +614,31 @@ mod tests {
         let output = "node001|idle|64|4/58/2/64|257000|128000|gpu:a100:4|healthy\n";
         let parsed = parse_sinfo(output);
         assert!(parsed.warnings.is_empty());
+        assert_eq!(parsed.rows[0].name, "node001");
         assert_eq!(parsed.rows[0].cpus.allocated, 4);
         assert_eq!(parsed.rows[0].gpu_total(), 4);
         assert_eq!(parsed.rows[0].memory_reserved.0, 129_000);
+        assert_eq!(parsed.rows[0].reason.as_deref(), Some("healthy"));
+    }
+
+    #[test]
+    fn parses_sinfo_wide_whitespace_rows() {
+        let output = "bartalloc1616          idle          64          0/0/0/64          257000          128000          gpu:a100:4\n";
+        let parsed = parse_sinfo(output);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.rows[0].name, "bartalloc1616");
+        assert_eq!(parsed.rows[0].cpus.allocated, 0);
+        assert_eq!(parsed.rows[0].gpu_total(), 4);
+    }
+
+    #[test]
+    fn parses_sinfo_single_space_rows() {
+        let output = "bartalloc1616 idle 64 0/0/0/64 257000 128000 gpu:a100:4\n";
+        let parsed = parse_sinfo(output);
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(parsed.rows[0].name, "bartalloc1616");
     }
 
     #[test]

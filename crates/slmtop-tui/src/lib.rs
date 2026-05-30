@@ -119,15 +119,25 @@ struct Theme {
     summary_all: Style,
     summary_me: Style,
     summary_others: Style,
-    _bar_filled: Color,
     _bar_empty: Color,
+    /// Filled segment of the disk-usage bar when its row is selected.
+    bar_selected_filled: Color,
     warning_border: Style,
 }
 
+const SELECTION_BG: Color = Color::Rgb(0, 188, 188);
+const SELECTION_FG: Color = Color::Rgb(8, 20, 24);
+
 fn selected_row_style() -> Style {
-    Style::default()
-        .fg(Color::Rgb(8, 20, 24))
-        .bg(Color::Rgb(0, 188, 188))
+    Style::default().fg(SELECTION_FG).bg(SELECTION_BG)
+}
+
+fn selection_background_style() -> Style {
+    Style::default().bg(SELECTION_BG)
+}
+
+fn selection_text_style() -> Style {
+    selected_row_style()
 }
 
 impl Theme {
@@ -167,8 +177,8 @@ impl Theme {
             summary_all: Style::default().fg(Color::Cyan),
             summary_me: Style::default().fg(Color::Green),
             summary_others: Style::default().fg(Color::Yellow),
-            _bar_filled: Color::Cyan,
             _bar_empty: Color::DarkGray,
+            bar_selected_filled: Color::Rgb(255, 95, 95),
             warning_border: Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -202,8 +212,8 @@ impl Theme {
             summary_all: Style::default().fg(cyan),
             summary_me: Style::default().fg(green),
             summary_others: Style::default().fg(orange),
-            _bar_filled: green,
             _bar_empty: bg_sel,
+            bar_selected_filled: Color::Rgb(255, 85, 85),
             warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
         }
     }
@@ -236,8 +246,8 @@ impl Theme {
             summary_all: Style::default().fg(teal),
             summary_me: Style::default().fg(green),
             summary_others: Style::default().fg(peach),
-            _bar_filled: teal,
             _bar_empty: surface1,
+            bar_selected_filled: red,
             warning_border: Style::default().fg(peach).add_modifier(Modifier::BOLD),
         }
     }
@@ -270,8 +280,8 @@ impl Theme {
             summary_all: Style::default().fg(purple),
             summary_me: Style::default().fg(green),
             summary_others: Style::default().fg(orange),
-            _bar_filled: blue,
             _bar_empty: gutter,
+            bar_selected_filled: red,
             warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
         }
     }
@@ -304,8 +314,8 @@ impl Theme {
             summary_all: Style::default().fg(blue),
             summary_me: Style::default().fg(cyan),
             summary_others: Style::default().fg(orange),
-            _bar_filled: cyan,
             _bar_empty: surface,
+            bar_selected_filled: red,
             warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
         }
     }
@@ -338,8 +348,8 @@ impl Theme {
             summary_all: Style::default().fg(purple),
             summary_me: Style::default().fg(green),
             summary_others: Style::default().fg(orange),
-            _bar_filled: blue,
             _bar_empty: bg_highlight,
+            bar_selected_filled: red,
             warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
         }
     }
@@ -372,8 +382,8 @@ impl Theme {
             summary_all: Style::default().fg(cyan),
             summary_me: Style::default().fg(green),
             summary_others: Style::default().fg(orange),
-            _bar_filled: cyan,
             _bar_empty: bg_highlight,
+            bar_selected_filled: red,
             warning_border: Style::default().fg(orange).add_modifier(Modifier::BOLD),
         }
     }
@@ -1261,32 +1271,63 @@ impl AppState {
         let sort_idx = disk_column_to_index(self.disk_sort);
         let direction = self.directions[PanelId::Disks.index()];
         let visible = self.visible_columns(PanelId::Disks, headers.len());
-        for disk in &disks {
+        let selected_row = self.disks_table.selected();
+        let empty_bar = Style::default().fg(self.theme._bar_empty);
+        let selected_empty_bar = Style::default().fg(Color::Rgb(0, 120, 120)).bg(SELECTION_BG);
+        for (row_idx, disk) in disks.iter().enumerate() {
             let filled = (usize::from(disk.use_percent) * bar_width) / 100;
             let empty = bar_width.saturating_sub(filled);
 
-            let color = match disk.label {
+            let disk_color = match disk.label {
                 slmtop_core::DiskLabel::Ssd => Color::LightGreen,
                 slmtop_core::DiskLabel::Hdd => Color::LightYellow,
                 slmtop_core::DiskLabel::Nfs => Color::LightBlue,
                 slmtop_core::DiskLabel::ParallelFs => Color::LightCyan,
                 slmtop_core::DiskLabel::Unknown => Color::Gray,
             };
+            let is_selected = selected_row == Some(row_idx);
+            let filled_style = if is_selected {
+                Style::default()
+                    .fg(self.theme.bar_selected_filled)
+                    .bg(SELECTION_BG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(disk_color)
+            };
+            let bracket_style = if is_selected {
+                selection_text_style()
+            } else {
+                Style::default()
+            };
+            let empty_style = if is_selected {
+                selected_empty_bar
+            } else {
+                empty_bar
+            };
 
-            let bar_text = format!(
-                "[{}{}] {:>3}%",
-                "█".repeat(filled),
-                " ".repeat(empty),
-                disk.use_percent
-            );
+            let usage_line = Line::from(vec![
+                Span::styled("[", bracket_style),
+                Span::styled("█".repeat(filled), filled_style),
+                Span::styled(" ".repeat(empty), empty_style),
+                Span::styled(format!("] {:>3}%", disk.use_percent), bracket_style),
+            ]);
+            let usage_cell = if is_selected {
+                Cell::from(usage_line).style(selection_background_style())
+            } else {
+                Cell::from(usage_line)
+            };
+            let text_cell = |text: String| {
+                if is_selected {
+                    Cell::from(text).style(selection_text_style())
+                } else {
+                    Cell::from(text)
+                }
+            };
             let cells = [
-                Cell::from(Line::from(Span::styled(
-                    bar_text,
-                    Style::default().fg(color),
-                ))),
-                Cell::from(disk.mount.clone()),
-                Cell::from(disk.label.as_str()),
-                Cell::from(format!("{}/{}", disk.used, disk.size)),
+                usage_cell,
+                text_cell(disk.mount.clone()),
+                text_cell(disk.label.as_str().to_string()),
+                text_cell(format!("{}/{}", disk.used, disk.size)),
             ];
             table_rows.push(Row::new(select_visible_cells(cells, &visible)));
         }
@@ -1302,10 +1343,11 @@ impl AppState {
         );
         self.add_header_hits(area, PanelId::Disks, &constraints);
         let header_cells = decorate_headers(&headers, sort_idx, direction, &visible);
+        // Do not use row_highlight_style here: its dark foreground overrides per-span
+        // bar colors. Selection is styled per cell so the usage bar can stay red.
         let table = Table::new(table_rows, constraints)
             .header(Row::new(header_cells).style(self.theme.header_style))
-            .block(self.themed_panel_block(title, self.focus == PanelId::Disks))
-            .row_highlight_style(self.theme.highlight);
+            .block(self.themed_panel_block(title, self.focus == PanelId::Disks));
         frame.render_stateful_widget(table, area, &mut self.disks_table);
     }
 
@@ -1443,8 +1485,14 @@ impl AppState {
             Line::from(format!("CPUs      : {}", job.cpus)),
             Line::from(format!("GPUs      : {gpu_text}")),
             Line::from(format!("Memory    : {}", job.memory)),
-            Line::from(format!("Time Used  : {}", slurm_time_display(&job.time_used))),
-            Line::from(format!("Time Limit : {}", slurm_time_display(&job.time_limit))),
+            Line::from(format!(
+                "Time Used  : {}",
+                slurm_time_display(&job.time_used)
+            )),
+            Line::from(format!(
+                "Time Limit : {}",
+                slurm_time_display(&job.time_limit)
+            )),
             Line::from(""),
             Line::from("c cancel | h hold | u release | r requeue | Esc close"),
         ]);
