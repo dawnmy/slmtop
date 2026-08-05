@@ -393,6 +393,7 @@ impl Theme {
 pub struct TuiOptions {
     pub tick_rate: Duration,
     pub theme: ThemeName,
+    pub filter_jobs_to_current_user: bool,
 }
 
 impl Default for TuiOptions {
@@ -400,6 +401,7 @@ impl Default for TuiOptions {
         Self {
             tick_rate: Duration::from_millis(80),
             theme: ThemeName::Catppuccin,
+            filter_jobs_to_current_user: false,
         }
     }
 }
@@ -437,6 +439,7 @@ where
         config.refresh_interval,
         config.disk_usage_timeout,
         options.theme,
+        options.filter_jobs_to_current_user,
     );
 
     loop {
@@ -873,6 +876,7 @@ impl AppState {
         refresh_interval: Duration,
         disk_usage_timeout: Option<Duration>,
         theme_name: ThemeName,
+        filter_jobs_to_current_user: bool,
     ) -> Self {
         let mut jobs_table = TableState::default();
         jobs_table.select(Some(0));
@@ -890,6 +894,17 @@ impl AppState {
         user_pending_table.select(Some(0));
         let mut disk_usage_table = TableState::default();
         disk_usage_table.select(Some(0));
+        let mut panels = [
+            PanelUiState::new(12),
+            PanelUiState::new(8),
+            PanelUiState::new(5),
+            PanelUiState::new(4),
+            PanelUiState::new(8),
+        ];
+        if filter_jobs_to_current_user {
+            panels[PanelId::Jobs.index()].filter.owner = Some("me".to_string());
+        }
+
         Self {
             current_user,
             refresh_interval,
@@ -909,13 +924,7 @@ impl AppState {
             pending_action: None,
             left_percent: 60,
             top_percent: 68,
-            panels: [
-                PanelUiState::new(12),
-                PanelUiState::new(8),
-                PanelUiState::new(5),
-                PanelUiState::new(4),
-                PanelUiState::new(8),
-            ],
+            panels,
             jobs_sort: JobColumn::JobId,
             nodes_sort: NodeColumn::State,
             gpu_sort: GpuColumn::Type,
@@ -4041,6 +4050,23 @@ pub fn version() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_user_option_starts_with_jobs_filtered_to_me() {
+        let app = AppState::new(
+            "xzhan9".to_string(),
+            Duration::from_secs(3),
+            None,
+            ThemeName::Catppuccin,
+            true,
+        );
+
+        assert_eq!(
+            app.panels[PanelId::Jobs.index()].filter.owner.as_deref(),
+            Some("me")
+        );
+        assert!(app.panels[PanelId::Nodes.index()].filter.is_empty());
+    }
 
     #[test]
     fn selected_row_style_uses_truecolor_dark_text_on_teal() {

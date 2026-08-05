@@ -44,7 +44,7 @@ Options:
   -l, --accounting-limit <ACCOUNTING_LIMIT>
           Recent sacct rows to keep [default: 100]
   -u, --user <USER>
-          Override the current username used for owner filters
+          Show only jobs owned by this user and use it as the current username
   -T, --theme <THEME>
           Color theme: catppuccin, monokai, tokyonight, dracula, onedark, nightowl, classic [default: catppuccin]
   -h, --help
