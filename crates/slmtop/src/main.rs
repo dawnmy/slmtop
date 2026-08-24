@@ -51,7 +51,7 @@ struct Args {
     #[arg(
         short = 'u',
         long,
-        help = "Override the current username used for owner filters"
+        help = "Show only jobs owned by this user and use it as the current username"
     )]
     user: Option<String>,
 
@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
         accounting_limit: args.accounting_limit,
         ..BackendConfig::default()
     };
+    let filter_jobs_to_current_user = args.user.is_some();
     if let Some(user) = args.user {
         config.current_user = user;
     }
@@ -91,6 +92,7 @@ async fn main() -> Result<()> {
     let theme = ThemeName::parse(&args.theme);
     let options = TuiOptions {
         theme,
+        filter_jobs_to_current_user,
         ..TuiOptions::default()
     };
 
