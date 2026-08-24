@@ -2562,7 +2562,7 @@ impl AppState {
         let mut users = summary
             .users
             .iter()
-            .filter(|(user, _)| user.as_str() != self.current_user.as_str())
+            .filter(|(user, _)| !user.eq_ignore_ascii_case(&self.current_user))
             .collect::<Vec<_>>();
         users.sort_by(|a, b| {
             summary_total_jobs(b.1)

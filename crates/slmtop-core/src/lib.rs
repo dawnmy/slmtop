@@ -628,8 +628,8 @@ pub fn filter_jobs<'a>(
             if let Some(owner) = &filter.owner {
                 let owner = owner.to_lowercase();
                 let matches_owner = match owner.as_str() {
-                    "me" => job.user == current_user,
-                    "others" | "other" => job.user != current_user,
+                    "me" => job.user.eq_ignore_ascii_case(current_user),
+                    "others" | "other" => !job.user.eq_ignore_ascii_case(current_user),
                     "all" => true,
                     user => job.user.eq_ignore_ascii_case(user),
                 };
@@ -705,8 +705,8 @@ pub fn filter_accounting<'a>(
             if let Some(owner) = &filter.owner {
                 let owner = owner.to_lowercase();
                 let matches_owner = match owner.as_str() {
-                    "me" => row.user == current_user,
-                    "others" | "other" => row.user != current_user,
+                    "me" => row.user.eq_ignore_ascii_case(current_user),
+                    "others" | "other" => !row.user.eq_ignore_ascii_case(current_user),
                     "all" => true,
                     user => row.user.eq_ignore_ascii_case(user),
                 };
@@ -744,7 +744,7 @@ pub fn summarize_jobs(jobs: &[Job], current_user: &str) -> JobSummary {
         let Some(target) = target else {
             continue;
         };
-        let owner_bucket = if job.user == current_user {
+        let owner_bucket = if job.user.eq_ignore_ascii_case(current_user) {
             "me"
         } else {
             "others"
@@ -818,4 +818,52 @@ pub fn bucket_display(bucket: &JobBucket) -> String {
 #[must_use]
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job_owned_by(user: &str) -> Job {
+        Job {
+            id: "1001".to_string(),
+            user: user.to_string(),
+            state: "RUNNING".to_string(),
+            partition: "cpu".to_string(),
+            qos: "normal".to_string(),
+            priority: 0,
+            name: "job".to_string(),
+            nodes: "1".to_string(),
+            node_list: "node01".to_string(),
+            cpus: 1,
+            memory: MemoryMb(1024),
+            gpus: GpuMap::new(),
+            gres_raw: String::new(),
+            time_used: "0:01".to_string(),
+            time_limit: "1:00".to_string(),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn owner_me_filter_ignores_username_case() {
+        let jobs = vec![job_owned_by("alice"), job_owned_by("bob")];
+        let filter = FilterExpression::parse("owner=me");
+
+        let mine = filter_jobs(&jobs, &filter, "Alice");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].user, "alice");
+
+        let others = filter_jobs(&jobs, &FilterExpression::parse("owner=others"), "Alice");
+        assert_eq!(others.len(), 1);
+        assert_eq!(others[0].user, "bob");
+    }
+
+    #[test]
+    fn summarize_jobs_buckets_me_ignoring_case() {
+        let jobs = vec![job_owned_by("alice"), job_owned_by("bob")];
+        let summary = summarize_jobs(&jobs, "ALICE");
+        assert_eq!(summary.me.running.jobs, 1);
+        assert_eq!(summary.others.running.jobs, 1);
+    }
 }
